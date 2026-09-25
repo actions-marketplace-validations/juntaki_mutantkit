@@ -182,11 +182,19 @@ public struct SchemataMutationRunner: Sendable {
     }
 
     public enum RunError: Error, CustomStringConvertible {
-        case baselineDidNotPass(diagnosis: String)
+        /// `record` is the failed baseline itself, carried rather than left
+        /// to be re-synthesized by whoever catches this: everything a reader
+        /// needs to tell a build failure from a suite that ran and failed
+        /// (the commands, the durations, the test summary) lives on it, and
+        /// a caller that only has `diagnosis` has no way to put any of it
+        /// back. `SchemataRunOrchestration.merge` attaches exactly this
+        /// record to the degraded report, which is what that function's own
+        /// doc comment already promises a reader will see.
+        case baselineDidNotPass(record: BaselineRecord, diagnosis: String)
 
         public var description: String {
             switch self {
-            case let .baselineDidNotPass(diagnosis):
+            case let .baselineDidNotPass(_, diagnosis):
                 "the schemata baseline did not pass, so no mutant can be scored against it: \(diagnosis)"
             }
         }
@@ -300,6 +308,11 @@ public struct SchemataMutationRunner: Sendable {
     /// (see `prepareBatchedPrimaries`): a "batch" of one token has no
     /// containment benefit over the unbatched path.
     private let schemataTokenBatchSize: Int
+    /// Counts *chunks*, not mutants: a chunk is this backend's unit of
+    /// build-and-test work, so it is what a human watching the run is
+    /// actually waiting on. The isolated backend counts mutants for the same
+    /// reason — there, one mutant is one build-and-test cycle.
+    private let progress: ProgressReporter?
 
     public init(
         planID: String,
@@ -320,7 +333,8 @@ public struct SchemataMutationRunner: Sendable {
         coverageCache: CoverageProfileCache? = nil,
         coverageCacheKey: CoverageProfileCache.Key? = nil,
         preEstablishedBaseline: SharedBaselineEstablisher.Outcome? = nil,
-        schemataTokenBatchSize: Int = 1
+        schemataTokenBatchSize: Int = 1,
+        progress: ProgressReporter? = nil
     ) {
         self.planID = planID
         self.workUnitID = workUnitID
@@ -341,6 +355,7 @@ public struct SchemataMutationRunner: Sendable {
         self.coverageCacheKey = coverageCacheKey
         self.preEstablishedBaseline = preEstablishedBaseline
         self.schemataTokenBatchSize = schemataTokenBatchSize
+        self.progress = progress
     }
 
     public func run() async throws -> Outcome {
@@ -348,9 +363,19 @@ public struct SchemataMutationRunner: Sendable {
         let baseline = established.record
         let perTestCoverage = established.perTestCoverage
         let coverage = established.coverage
+        // Both paths in `establishBaseline` already throw on a baseline that
+        // did not pass, each with its own observed diagnosis. What is left
+        // here is the one case neither covers: a caller-supplied
+        // `.established(_)` whose `record` nevertheless says it failed —
+        // `SharedBaselineEstablisher` never produces one, but the type
+        // permits it, and proceeding would score mutants against a suite
+        // that was never green. Only here is a sentence reconstructed from
+        // the counts, because here there is no observation left to quote.
         guard baseline.passed else {
             let summary = baseline.testSummary.map { "\($0.failed) of \($0.total) tests failed" }
-            throw RunError.baselineDidNotPass(diagnosis: summary ?? "the baseline test run did not pass")
+            throw RunError.baselineDidNotPass(
+                record: baseline, diagnosis: summary ?? "the baseline test run did not pass"
+            )
         }
 
         // ADR-0008 §4(b): a `MutationID` embedded into more than one target
@@ -443,6 +468,7 @@ public struct SchemataMutationRunner: Sendable {
                 entryOutcomes.append(contentsOf: result.outcomes)
                 buildFailureEvents.append(contentsOf: result.buildFailureEvents)
                 infrastructureFallbackEvents.append(contentsOf: result.infrastructureFallbackEvents)
+                await progress?.recordCompletion()
                 if let program = remainingPrograms.next() {
                     group.addTask {
                         await self.runChunkTracked(
@@ -711,11 +737,19 @@ public struct SchemataMutationRunner: Sendable {
         let coverage: CoverageMap?
     }
 
+    /// Throws `RunError.baselineDidNotPass` rather than returning a failed
+    /// record, so the diagnosis is thrown by whoever actually observed the
+    /// failure and no caller has to reconstruct one. The alternative this
+    /// replaces — returning the record and letting `run()` re-derive a
+    /// sentence from `testSummary` — could only ever say "N of M tests
+    /// failed", and on the failure shape that actually occurred in CI (a
+    /// baseline whose suite ran nothing: `0 of 0`) that names neither what
+    /// failed nor that nothing ran at all.
     private func establishBaseline() async throws -> BaselineEstablishment {
         if let preEstablishedBaseline {
             switch preEstablishedBaseline {
-            case let .failed(record, _):
-                return BaselineEstablishment(record: record, perTestCoverage: nil, coverage: nil)
+            case let .failed(record, diagnosis):
+                throw RunError.baselineDidNotPass(record: record, diagnosis: diagnosis)
             case let .established(shared):
                 return BaselineEstablishment(record: shared.record, perTestCoverage: shared.perTestCoverage, coverage: shared.coverage)
             }
@@ -762,15 +796,22 @@ public struct SchemataMutationRunner: Sendable {
             testDurationSeconds: testDurationSeconds
         )
 
+        // Thrown here, where `run` — the observation itself — is still in
+        // hand: `SharedBaselineEstablisher` words the identical failure the
+        // identical way, and neither wording is re-derived from the record's
+        // counts afterwards.
+        guard record.passed else {
+            throw RunError.baselineDidNotPass(record: record, diagnosis: SharedBaselineEstablisher.suiteDidNotPassDiagnosis(run))
+        }
+
         // Per-test attribution (`execution.selectCoveringTests`), measured
         // — like isolated mode's own `MutationRunner.establishBaseline` —
         // *before* the sandbox above is destroyed by the caller: the
         // per-test coverage read needs the same instrumented artifact/
-        // sandbox `runBaseline` just used. Only attempted once the baseline
-        // is known to have passed (a failed baseline makes `run()` throw
-        // `RunError.baselineDidNotPass` regardless, and there is nothing
-        // legitimate to attribute against a suite that did not pass), only
-        // when configured, and only when the adapter actually conforms to
+        // sandbox `runBaseline` just used. Only reached once the baseline is
+        // known to have passed (the guard above already threw otherwise, and
+        // there is nothing legitimate to attribute against a suite that did
+        // not pass), only when configured, and only when the adapter conforms to
         // `TestSelecting` — mirroring `MutationRunner`'s exact guard
         // structure so a coverage-blind schemata adapter (no `TestSelecting`
         // conformance) behaves identically to before this parameter existed.
@@ -784,7 +825,7 @@ public struct SchemataMutationRunner: Sendable {
         // way, because the suite-must-pass gate and the timeout calibration
         // are not facts a cache can stand in for.
         var perTestCoverage: PerTestCoverageMap?
-        if record.passed, selectCoveringTests {
+        if selectCoveringTests {
             let coverageSpanStart = GateTimingRecorder.shared.now()
             if let key = coverageCacheKey, let cached = await coverageCache?.load(key) {
                 perTestCoverage = cached
@@ -800,7 +841,21 @@ public struct SchemataMutationRunner: Sendable {
             }
         }
 
-        return BaselineEstablishment(record: record, perTestCoverage: perTestCoverage, coverage: perTestCoverage?.aggregate())
+        // Reported to stderr only: this runner has no `OperationalIssueLog`
+        // of its own, and this path runs only when no baseline was
+        // pre-established for it — the `SharedBaselineEstablisher` that
+        // normally establishes a schemata run's baseline reports the same
+        // fact into `RunReport.operationalIssues` itself.
+        if let perTestCoverage { await PerTestCoverageAttribution.report(perTestCoverage, to: nil) }
+        // `flatMap`, not `?.`: `aggregate()` is itself optional now, and
+        // returns `nil` for a partial attribution precisely so the
+        // `.noCoverage` fast path cannot be driven by one (see its own doc
+        // comment). Flattening keeps "no map at all" and "a map that cannot
+        // answer the uncovered question" as the one value every caller
+        // already handles.
+        return BaselineEstablishment(
+            record: record, perTestCoverage: perTestCoverage, coverage: perTestCoverage.flatMap { $0.aggregate() }
+        )
     }
 
     // MARK: - Per chunk

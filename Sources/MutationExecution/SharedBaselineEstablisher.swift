@@ -32,7 +32,8 @@ public enum SharedBaselineEstablisher {
         configuration: Configuration,
         projectRoot: URL,
         coverageCache: CoverageProfileCache?,
-        coverageCacheKey: CoverageProfileCache.Key?
+        coverageCacheKey: CoverageProfileCache.Key?,
+        operationalIssues: OperationalIssueLog? = nil
     ) async -> Outcome {
         let started = Date()
         let timeouts = TimeoutController(settings: configuration.timeouts)
@@ -80,39 +81,20 @@ public enum SharedBaselineEstablisher {
         )
 
         guard run.status == .passed else {
-            return .failed(
-                record: record,
-                diagnosis: """
-                The unmutated suite did not pass (\(run.status.rawValue)): \(run.diagnosis) Every \
-                mutant is measured against this run, so nothing can be concluded until it is green.
-                """
-            )
+            return .failed(record: record, diagnosis: suiteDidNotPassDiagnosis(run))
         }
 
-        var perTestCoverage: PerTestCoverageMap?
-        var coverage: CoverageMap?
-        var profilingDurationSeconds: Double?
-        if configuration.execution.selectCoveringTests {
-            if let key = coverageCacheKey, let cached = await coverageCache?.load(key) {
-                perTestCoverage = cached
-                coverage = cached.aggregate()
-            } else if let selecting = test as? any TestSelecting {
-                let profilingStarted = Date()
-                perTestCoverage = await selecting.measurePerTestCoverage(
-                    artifact: artifact, in: sandbox, timeoutSeconds: timeouts.baselineLimitSeconds
-                )
-                coverage = perTestCoverage?.aggregate()
-                profilingDurationSeconds = (profilingDurationSeconds ?? 0) + Date().timeIntervalSince(profilingStarted)
-                if let measured = perTestCoverage, let key = coverageCacheKey {
-                    await coverageCache?.store(measured, for: key)
-                }
-            }
-        }
-        if coverage == nil, configuration.execution.measureCoverage, let measuring = test as? any CoverageMeasuring {
-            let profilingStarted = Date()
-            coverage = await measuring.readCoverage(in: sandbox, projectRoot: projectRoot)
-            profilingDurationSeconds = (profilingDurationSeconds ?? 0) + Date().timeIntervalSince(profilingStarted)
-        }
+        // The one step this establisher does *not* implement in parallel with
+        // `MutationRunner.establishBaseline` -- see
+        // `BaselineCoverageMeasurement`'s own doc comment for why this
+        // particular step must not have two copies.
+        let measured = await BaselineCoverageMeasurement(
+            configuration: configuration, cache: coverageCache, cacheKey: coverageCacheKey,
+            operationalIssues: operationalIssues
+        ).measure(
+            with: test, against: artifact, in: sandbox, projectRoot: projectRoot,
+            timeoutSeconds: timeouts.baselineLimitSeconds
+        )
 
         let recordWithProfiling = BaselineRecord(
             passed: record.passed,
@@ -123,15 +105,32 @@ public enum SharedBaselineEstablisher {
             testCommand: record.testCommand,
             buildDurationSeconds: record.buildDurationSeconds,
             testDurationSeconds: record.testDurationSeconds,
-            profilingDurationSeconds: profilingDurationSeconds
+            profilingDurationSeconds: measured.profilingDurationSeconds
         )
 
         return .established(EstablishedBaseline(
             record: recordWithProfiling,
             testDurationSeconds: testDuration,
-            perTestCoverage: perTestCoverage,
-            coverage: coverage
+            perTestCoverage: measured.perTestCoverage,
+            coverage: measured.coverage
         ))
+    }
+
+    /// The one sentence every backend uses for "the unmutated suite ran and
+    /// did not pass", public so `SchemataMutationRunner`'s own non-shared
+    /// baseline path words it identically instead of keeping a second copy.
+    ///
+    /// It carries `status` and the adapter's structured `diagnosis` rather
+    /// than the test counts, because the counts alone cannot distinguish the
+    /// failures that matter: a suite where nothing ran at all and one where
+    /// assertions failed both render as "0 of 0 tests failed" once the
+    /// summary is reduced to numbers, and the first is an infrastructure
+    /// fact while the second is a real red suite.
+    public static func suiteDidNotPassDiagnosis(_ run: TestRunResult) -> String {
+        """
+        The unmutated suite did not pass (\(run.status.rawValue)): \(run.diagnosis) Every \
+        mutant is measured against this run, so nothing can be concluded until it is green.
+        """
     }
 
     private static func unusableBaseline(startedAt: Date, buildCommand: CommandRecord? = nil) -> BaselineRecord {

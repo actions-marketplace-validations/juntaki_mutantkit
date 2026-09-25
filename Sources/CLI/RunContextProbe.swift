@@ -129,6 +129,117 @@ enum RunContextProbe {
         return RunContextFingerprint(value: ContentHash.of(components.joined(separator: "\u{1F}")))
     }
 
+    /// How much of the run's context a given cached artifact's identity
+    /// actually depends on — both how much of the `Configuration`, and how
+    /// precisely the tool's own implementation is identified. See
+    /// `computeContextDigest`'s "Identity scope" section for why this is
+    /// not one answer for both caches.
+    enum IdentityScope {
+        /// Everything (bar `execution.workers`, and `qualityGate`, which
+        /// `configurationHash` zeroes itself). The conservative default: a
+        /// setting added later is folded in without anyone having to
+        /// remember to, and an input that turns out not to matter costs only
+        /// a missed cache hit.
+        case wholeConfiguration
+        /// Only what a baseline's per-test coverage attribution is actually
+        /// a function of — which is far less than the whole configuration,
+        /// and provably so, because the measurement's own inputs are
+        /// enumerable: `TestSelecting.measurePerTestCoverage` receives the
+        /// baseline artifact, the sandbox, and a timeout, and the adapter it
+        /// is called on is constructed from `project` and `tests`.
+        ///
+        /// Kept, therefore: `project` (which scheme/destination/derived data
+        /// the tests run under), `tests` (which targets are enumerated and
+        /// run at all), plus the worktree content digest and the toolchain
+        /// components the caller folds in separately.
+        ///
+        /// Dropped, each for a stated reason rather than as a batch:
+        /// - `operators`, `reports`, `qualityGate`: inputs to planning,
+        ///   reporting and merge policy. The baseline is unmutated; none of
+        ///   them is an input to what a test executes.
+        /// - `sources`: narrows which files get *mutants*. The map records
+        ///   what each test executed, over whatever the suite reaches; it is
+        ///   not filtered by source scope, so narrowing `sources.include`
+        ///   cannot remove an entry from it.
+        /// - `execution`: `selectCoveringTests` gates whether the pass runs
+        ///   at all, `strategy` decides which backend consumes the map, and
+        ///   the rest (`workers`, `testBatchSize`, the re-test/confirm
+        ///   flags, `incrementalBuild`, `simulatorPool`) govern how *mutants*
+        ///   are built and run. A schemata run and an isolated run both
+        ///   measure this against `buildBaseline`'s own unmutated artifact —
+        ///   which is what `SchemataRunOrchestration` already relies on when
+        ///   it hands one cache key to both backends within a single run.
+        /// - `timeouts`: bounds each isolated test run. It cannot silently
+        ///   shrink a map, because a test that times out is not partially
+        ///   attributed — it lands in `PerTestCoverageMap.unattributedTests`
+        ///   and is then run for every mutant regardless.
+        ///
+        /// Section-granular, which leaves one obligation: a *new field*
+        /// added inside one of the dropped sections that does change what
+        /// the baseline measures must bump this purpose's own tag, exactly
+        /// as `resultCache2` had to.
+        case coverageAttribution
+
+        /// How this scope identifies "the MutantKit build that produced the
+        /// artifact".
+        ///
+        /// `.wholeConfiguration` uses the release version and commit SHA,
+        /// which is automatic and cannot be forgotten. `.coverageAttribution`
+        /// uses `ExecutionImplementationVersion` instead, and the reason is
+        /// that the commit SHA is both too strict and too weak for this
+        /// artifact, in opposite directions:
+        ///
+        /// - Too strict for a release build, where the SHA is stamped in:
+        ///   a README-only commit changes it and throws away a measurement
+        ///   that cost ~100 minutes. Observed in the field — two installs of
+        ///   the same `1.0.4-dev` version, differing only in commits that
+        ///   never touched the measurement, could not share a map.
+        /// - Too weak for a development build, where `ToolVersion.commitSHA`
+        ///   is `nil` and `version` is a placeholder, so *every* locally
+        ///   built binary shares one identity no matter what changed inside
+        ///   it. `ExecutionImplementationVersion`'s own doc comment names
+        ///   this as the gap it exists to close.
+        ///
+        /// The result cache keeps the SHA as well, deliberately: it already
+        /// checks `ExecutionImplementationVersion` *and*
+        /// `MutationVerdictVerifier.currentVersion` at load time, so the SHA
+        /// there is a third, automatic belt on top of two precise braces. The
+        /// coverage cache has no such load-time check, so moving it to the
+        /// precise mechanism gives it the guard it was missing rather than
+        /// removing one it had.
+        var toolIdentityComponents: [String] {
+            switch self {
+            case .wholeConfiguration:
+                []
+            case .coverageAttribution:
+                ["executionImplementationVersion=\(ExecutionImplementationVersion.current)"]
+            }
+        }
+
+        /// Whether the tool's release version and commit SHA identify the
+        /// build for this scope. False only where something more precise
+        /// stands in — see `toolIdentityComponents`.
+        var usesToolReleaseIdentity: Bool {
+            switch self {
+            case .wholeConfiguration: true
+            case .coverageAttribution: false
+            }
+        }
+
+        func narrow(_ configuration: inout Configuration) {
+            switch self {
+            case .wholeConfiguration:
+                break
+            case .coverageAttribution:
+                configuration.sources = SourceSettings()
+                configuration.operators = OperatorSettings()
+                configuration.execution = ExecutionSettings()
+                configuration.timeouts = TimeoutSettings()
+                configuration.reports = []
+            }
+        }
+    }
+
     /// A digest of everything a cached, per-mutation-independent artifact
     /// depends on — used for both `CoverageProfileCache` (baseline per-test
     /// coverage attribution) and `MutationResultCache` (a mutant's
@@ -165,11 +276,29 @@ enum RunContextProbe {
     /// marker rather than each `purpose` tag is exact — the change is to the
     /// scheme both purposes share, not to what makes either one's payload
     /// trustworthy.
+    ///
+    /// ## Configuration scope
+    ///
+    /// `configurationScope` exists because the two purposes do not depend on
+    /// the same configuration. A mutant's evaluated outcome can depend on
+    /// nearly all of it, so `.wholeConfiguration` is the default and the
+    /// conservative one — a setting added later is folded in automatically,
+    /// and the cost of an input that turns out not to matter is only a
+    /// missed hit. Baseline per-test coverage attribution genuinely depends
+    /// on far less, and scoping it down is not a hit-rate nicety: measured
+    /// on a real iOS project, the pass costs ~100 minutes, and keying it on
+    /// the whole configuration meant that comparing `strategy: isolated`
+    /// against `strategy: schemata`, or raising `budget.maxMutants` from 50
+    /// to 150, re-measured all 100 minutes each time — while every one of
+    /// those runs measured a provably identical map. See
+    /// `ConfigurationScope.coverageAttribution` for what it keeps and the
+    /// argument for each thing it drops.
     static func computeContextDigest(
         projectRoot: URL,
         configuration: Configuration,
         toolchain: ToolchainFingerprint,
         purpose: String,
+        identityScope: IdentityScope = .wholeConfiguration,
         toolchainCacheIdentityComplete: Bool = true,
         processRunner: ProcessRunner = defaultProcessRunner
     ) async throws -> String {
@@ -192,12 +321,16 @@ enum RunContextProbe {
         // measures/produces the identical thing.
         var scopedConfiguration = configuration
         scopedConfiguration.execution.workers = nil
+        identityScope.narrow(&scopedConfiguration)
 
+        let toolReleaseIdentity = identityScope.usesToolReleaseIdentity
+            ? ["toolVersion=\(toolchain.toolVersion)", "toolCommitSHA=\(toolchain.toolCommitSHA ?? "unknown")"]
+            : []
         let components = [
-            "\(purpose)=v4",
-            "configurationHash=\(scopedConfiguration.configurationHash)",
-            "toolVersion=\(toolchain.toolVersion)",
-            "toolCommitSHA=\(toolchain.toolCommitSHA ?? "unknown")",
+            "\(purpose)=v4"
+        ] + [
+            "configurationHash=\(scopedConfiguration.configurationHash)"
+        ] + toolReleaseIdentity + identityScope.toolIdentityComponents + [
             "swiftVersion=\(toolchain.swiftVersion)",
             "swiftSyntaxVersion=\(toolchain.swiftSyntaxVersion)",
             "xcodeVersion=\(toolchain.xcodeVersion ?? "unknown")",

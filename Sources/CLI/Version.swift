@@ -1,3 +1,5 @@
+import MutationModel
+
 /// Build identity, embedded at release time.
 ///
 /// Every plan and report records these. A result that cannot be traced back to
@@ -17,10 +19,32 @@ public enum ToolVersion {
     /// SwiftSyntax version this binary was linked against. Recorded because a
     /// SwiftSyntax change can move a node's trivia boundaries, which moves byte
     /// anchors, which changes Mutation IDs.
-    public static let swiftSyntaxVersion = "603.0.0"
+    ///
+    /// SwiftSyntax exposes no version symbol to read this from, so it stays a
+    /// literal — but an unchecked literal is the failure `planSchemaVersion`
+    /// below describes, and here it is worse than a wrong `--version` line:
+    /// `PlanCompatibility.check` warns that byte anchors may have moved by
+    /// comparing this value in a stored plan against this value now, so a
+    /// dependency bumped without bumping this compares the stale constant to
+    /// itself and the warning silently never fires.
+    /// `SwiftSyntaxVersionPinConsistencyTests` ties it to `Package.resolved`.
+    public static let swiftSyntaxVersion = "604.0.0"
 
-    public static let planSchemaVersion = 1
-    public static let reportSchemaVersion = 1
+    /// Read from `SchemaVersion`, never copied. These are the same fact as
+    /// the constants the plan and report writers stamp into their own files,
+    /// and a second literal here is a second thing to remember: bumping
+    /// `SchemaVersion.plan` while this stayed at its old value would leave
+    /// `mutantkit --version` reporting a schema the tool no longer writes —
+    /// a lie in the one output whose entire job is to say what this build
+    /// is. Nothing tied the two before, and nothing checked them.
+    ///
+    /// Same reasoning `Scripts/release-build.sh` already applies to the
+    /// schemata runtime ABI version, which it reads out of the C header
+    /// rather than duplicating: "a hand-maintained second copy is exactly
+    /// the kind of drift that would make a genuine release silently
+    /// mismatch".
+    public static let planSchemaVersion = SchemaVersion.plan
+    public static let reportSchemaVersion = SchemaVersion.result
 
     public static var summary: String {
         var lines = ["mutantkit \(version)"]

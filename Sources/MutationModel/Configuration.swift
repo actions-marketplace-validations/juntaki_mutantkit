@@ -69,6 +69,104 @@ public struct Configuration: Codable, Sendable, Hashable {
         guard let data = try? encoder.encode(hashed) else { return ContentHash.of("<unencodable>") }
         return ContentHash.of(data)
     }
+
+    /// Hash of only the settings that can reach a build command — the
+    /// identity a lowered schemata plan is validated against
+    /// (`SchemataPlan.validate`'s `buildArgumentsMismatch`).
+    ///
+    /// The whole configuration was used for this, which meant a lowered plan
+    /// was *rejected* — and every chunk re-lowered — when anything at all in
+    /// `mutantkit.yml` changed, including the report format. Same shape as
+    /// the two identities `planningHash` and `IdentityScope` exist to fix:
+    /// wider than the thing it guards, so it discards work that was still
+    /// valid.
+    ///
+    /// ## Why this zeroes sections rather than naming the fields it keeps
+    ///
+    /// The tempting formulation is a list of the build-affecting settings.
+    /// This codebase has already tried that and been burned by it, in this
+    /// exact area: `SchemataPlan.deriveSchemataPlanID`'s own doc comment
+    /// records that "a manually-enumerated list is exactly how the first
+    /// version of this hash silently omitted `fallbackReason`,
+    /// `conflictGroup`, and `target`/`module`/`product`", and the fix was to
+    /// stop enumerating.
+    ///
+    /// So this names only what it *drops*, and drops whole sections rather
+    /// than individual fields:
+    ///
+    /// - `sources` and `operators` decide which mutations exist. A change to
+    ///   either produces a different plan, whose entries are already part of
+    ///   `SchemataPlanID` — this identity does not need to catch it a second
+    ///   time.
+    /// - `timeouts` bounds how long a command is waited on, never what
+    ///   command is invoked.
+    /// - `reports` is output formatting; `qualityGate` is CI merge policy,
+    ///   evaluated after a run has already finished.
+    ///
+    /// Everything else — `project` (scheme, destination, derived data),
+    /// `tests` (which targets get built), and the *whole* of `execution`
+    /// (where `incrementalBuild`, `sharedModuleCache`, `simulatorPool` and
+    /// any build-affecting setting added later live) — is kept untouched.
+    /// A field added to any of those is folded in automatically, and the
+    /// cost of one that turns out not to matter is a re-lowering, never a
+    /// lowered plan accepted against build arguments it was not built with.
+    public var buildIdentityHash: String {
+        var hashed = self
+        hashed.sources = SourceSettings()
+        hashed.operators = OperatorSettings()
+        hashed.timeouts = TimeoutSettings()
+        hashed.reports = []
+        hashed.qualityGate = QualityGateSettings()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(hashed) else { return ContentHash.of("<unencodable>") }
+        return ContentHash.of(data)
+    }
+
+    /// Hash of only the settings that decide *what gets planned* — which
+    /// mutants exist at all, not how they are then executed.
+    ///
+    /// `configurationHash` above covers the whole configuration, which makes
+    /// it the right identity for "was this produced under the same settings"
+    /// and the wrong one for "would re-planning produce a different plan".
+    /// Using it for the second question means any execution-only edit
+    /// between `plan` and `run` — turning on `selectCoveringTests`, changing
+    /// `workers`, adding a report format — reports a plan/configuration
+    /// mismatch that does not exist. Observed in the field: adding
+    /// `execution.selectCoveringTests: true` to `mutantkit.yml` after
+    /// planning warned that the plan no longer matched the configuration,
+    /// which is alarming, unactionable, and false.
+    ///
+    /// Scoped by what planning actually reads, which is enumerable:
+    /// `MutationPlanner.makePlan` reads `sources`, `operators`,
+    /// `execution.budget` and `execution.diffBase`; `PlanCommand` resolves
+    /// SwiftPM's live source set from `project` before handing it over. The
+    /// rest — `tests`, `timeouts`, `reports`, `qualityGate`, and every other
+    /// `execution` field — is read only while executing a plan that already
+    /// exists.
+    ///
+    /// Everything outside `execution` is zeroed by name, so a *new* top-level
+    /// section is folded in by default; that is the conservative direction,
+    /// since an unnecessary input costs a false warning and a missing one
+    /// costs a missed real change. Inside `execution` the two planning
+    /// fields are named explicitly instead, which leaves one obligation: an
+    /// execution field added later that does change what gets planned must be
+    /// preserved here too.
+    public var planningHash: String {
+        var hashed = self
+        hashed.tests = TestSettings()
+        hashed.timeouts = TimeoutSettings()
+        hashed.reports = []
+        hashed.qualityGate = QualityGateSettings()
+        let planningExecution = (budget: execution.budget, diffBase: execution.diffBase)
+        hashed.execution = ExecutionSettings()
+        hashed.execution.budget = planningExecution.budget
+        hashed.execution.diffBase = planningExecution.diffBase
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(hashed) else { return ContentHash.of("<unencodable>") }
+        return ContentHash.of(data)
+    }
 }
 
 // MARK: - Project

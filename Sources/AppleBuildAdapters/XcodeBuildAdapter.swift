@@ -80,6 +80,17 @@ public struct XcodeBuildAdapter: Sendable {
     /// time, and CI disproved that assumption.
     let processRunner: ProcessRunner
 
+    /// Where each `xcodebuild -list -json` attempt's timing is appended, or
+    /// `nil` to record nothing — the default on every path that does not say
+    /// otherwise, since the variable is unset outside CI.
+    ///
+    /// Read once here rather than from the global environment at each call
+    /// site so a test can point one adapter at its own file without setting a
+    /// process-wide variable that every *other* adapter running concurrently
+    /// in the same test process would then also write to.
+    var schemeDiscoveryLogPath: String? =
+        ProcessInfo.processInfo.environment[SchemeDiscoveryObservationLog.environmentVariable]
+
     public init(
         configuration: Configuration,
         kind: ProjectKind,
@@ -361,10 +372,11 @@ public struct XcodeBuildAdapter: Sendable {
         guard !schemes.isEmpty else {
             throw BuildFailure(
                 kind: .infrastructure,
-                diagnosis: """
-                No schemes are available here. Open the project in Xcode and mark a \
-                scheme shared, or set project.scheme in mutantkit.yml.
-                """,
+                diagnosis: SchemeResolutionDiagnosis.noSchemeResolved(
+                    answered: discovery.answered,
+                    lastResult: discovery.lastResult,
+                    timeoutSeconds: Self.schemeListTimeoutSeconds
+                ),
                 command: listCommand(in: workspace, result: discovery.lastResult),
                 output: discovery.lastResult?.combinedOutput ?? ""
             )
@@ -396,9 +408,14 @@ public struct XcodeBuildAdapter: Sendable {
 
     /// Discovered schemes, or an empty list when discovery itself failed.
     ///
-    /// Non-throwing because every caller treats "could not ask" and "there are
-    /// none" the same way: both mean no scheme can be resolved, and both are
-    /// reported with the same remedy.
+    /// Non-throwing because the two callers that take this plain `[String]`
+    /// form (`XcodeConfigDetector`, `Diagnostics`) genuinely treat "could not
+    /// ask" and "there are none" the same way: both mean no scheme can be
+    /// resolved here and now, and neither caller is reporting a failure to a
+    /// user. `resolveScheme` is the one that *is*, and it deliberately does
+    /// not use this form — see `SchemeDiscoveryResult.answered`, and
+    /// `SchemeResolutionDiagnosis` for the real CI failure that proved the
+    /// two must not share one remedy.
     ///
     /// `public`, not just used internally by `resolveScheme`: `XcodeConfigDetector`
     /// (`init`/`doctor` auto-detection) needs this exact same real
@@ -434,24 +451,79 @@ public struct XcodeBuildAdapter: Sendable {
     struct SchemeDiscoveryResult {
         let schemes: [String]
         let lastResult: ProcessResult?
+        /// Whether `xcodebuild` actually produced a scheme list to read.
+        ///
+        /// `schemes.isEmpty` alone cannot answer that, and conflating the
+        /// two is precisely how a 120-second timeout with empty output got
+        /// reported to a user as "no schemes are available here" — see
+        /// `SchemeResolutionDiagnosis`. `false` means the emptiness is an
+        /// absence of evidence; `true` means `xcodebuild` was asked, it
+        /// answered, and the answer was none.
+        let answered: Bool
     }
+
+    /// `xcodebuild -list -json`'s own budget. Named rather than inlined so
+    /// the diagnosis for a run killed at this deadline can quote the number
+    /// the run was actually held to, instead of a second copy of it.
+    static let schemeListTimeoutSeconds: Double = 120
 
     func discoverSchemesWithDiagnostics(
         in workspace: URL, emptyResultRetryCount: Int = 2
     ) async -> SchemeDiscoveryResult {
         let arguments = projectArguments(in: workspace) + ["-list", "-json"]
+        // Every `return` below is preceded by one observation row, and the
+        // fall-through case records one too, so the log holds one row per
+        // attempt actually made -- successes included. Successes are the
+        // whole point: three failures at the 120s deadline say the budget
+        // touches the distribution's edge and nothing more, and the budget
+        // stays where it is until the successful durations say what it
+        // should be. See `SchemeDiscoveryObservationLog`.
+        func observe(_ outcome: SchemeDiscoveryObservationLog.Outcome,
+                     attempt: Int, result: ProcessResult?, schemeCount: Int) {
+            SchemeDiscoveryObservationLog.record(
+                attempt: attempt,
+                outcome: outcome,
+                result: result,
+                schemeCount: schemeCount,
+                budgetSeconds: Self.schemeListTimeoutSeconds,
+                path: schemeDiscoveryLogPath
+            )
+        }
         for attempt in 0 ... emptyResultRetryCount {
-            let result = try? await processRunner(ToolPaths.xcodebuild, arguments, workspace, 120)
+            let result = try? await processRunner(
+                ToolPaths.xcodebuild, arguments, workspace, Self.schemeListTimeoutSeconds
+            )
             guard let result, result.succeeded else {
-                return SchemeDiscoveryResult(schemes: [], lastResult: result)
+                observe(result == nil ? .notStarted : .didNotSucceed,
+                        attempt: attempt, result: result, schemeCount: 0)
+                return SchemeDiscoveryResult(schemes: [], lastResult: result, answered: false)
             }
             let schemes = SchemeListJSON.schemes(from: result.standardOutput)
-            if !schemes.isEmpty || attempt == emptyResultRetryCount {
-                return SchemeDiscoveryResult(schemes: schemes, lastResult: result)
+            if !schemes.isEmpty {
+                observe(.schemesFound, attempt: attempt, result: result, schemeCount: schemes.count)
+                return SchemeDiscoveryResult(schemes: schemes, lastResult: result, answered: true)
             }
+            // An empty list read out of output the supervisor never confirmed
+            // it had fully drained is not an answer: `ProcessResult
+            // .outputComplete`'s own contract requires every consumer that
+            // derives a failure classification to fail closed here, and the
+            // classification this feeds ("the project has no schemes") is
+            // exactly the kind that must not rest on possibly-truncated
+            // bytes. A *non-empty* list needs no such guard — truncated JSON
+            // does not parse, so any scheme name read out at all came from
+            // a complete document.
+            guard result.outputComplete else {
+                observe(.outputIncomplete, attempt: attempt, result: result, schemeCount: 0)
+                return SchemeDiscoveryResult(schemes: [], lastResult: result, answered: false)
+            }
+            if attempt == emptyResultRetryCount {
+                observe(.answeredNone, attempt: attempt, result: result, schemeCount: 0)
+                return SchemeDiscoveryResult(schemes: [], lastResult: result, answered: true)
+            }
+            observe(.emptyRetrying, attempt: attempt, result: result, schemeCount: 0)
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
-        return SchemeDiscoveryResult(schemes: [], lastResult: nil)
+        return SchemeDiscoveryResult(schemes: [], lastResult: nil, answered: false)
     }
 }
 
@@ -1043,8 +1115,12 @@ extension XcodeBuildAdapter: SchemataBuildable {
         defer {
             Task { await GateTimingRecorder.shared.record("receipt.resolve", chunkID: context.chunkID, start: receiptStart) }
         }
+        // Deliberately not `destination()`: reading back where this chunk's
+        // product was written must not depend on the run's device still
+        // existing — see `DestinationResolver.buildSettingsDestination(for:)`.
         let buildSettingsContext = XcodeCompilationUnitImageResolver.BuildSettingsContext(
-            projectArguments: projectArguments(in: workspace), scheme: try await resolveScheme(in: workspace), destination: destination(),
+            projectArguments: projectArguments(in: workspace), scheme: try await resolveScheme(in: workspace),
+            destination: DestinationResolver.buildSettingsDestination(for: destination()),
             derivedDataPath: derivedDataPath(in: workspace), workspace: workspace, timeoutSeconds: configuration.timeouts.baselineSeconds
         )
         let targetsByName = Dictionary(grouping: units, by: \.buildTarget.targetName)
@@ -1379,20 +1455,10 @@ extension XcodeBuildAdapter: TestSelecting {
         in workspace: URL,
         timeoutSeconds: Double
     ) async -> PerTestCoverageMap? {
-        switch await measurePerTestCoverageFast(
-            artifact: artifact,
-            in: workspace,
-            timeoutSeconds: timeoutSeconds
-        ) {
-        case let .complete(map):
-            return map
-        case .unavailable:
-            return await measurePerTestCoverageSerial(
-                artifact: artifact,
-                in: workspace,
-                timeoutSeconds: timeoutSeconds
-            )
-        }
+        await PerTestCoverageProfileAttempt.resolve(
+            fast: { await measurePerTestCoverageFast(artifact: artifact, in: workspace, timeoutSeconds: timeoutSeconds) },
+            serial: { await measurePerTestCoverageSerial(artifact: artifact, in: workspace, timeoutSeconds: timeoutSeconds) }
+        )
     }
 
     private func measurePerTestCoverageFast(
@@ -1416,26 +1482,17 @@ extension XcodeBuildAdapter: TestSelecting {
     /// leased devices concurrently is a further optimisation, not attempted
     /// here.
     ///
-    /// All-or-nothing (parity with `SwiftPackageMacOSAdapter.measurePerTestCoverage`):
-    /// a test whose isolated run cannot be proven —
-    /// order-dependent and failing alone, crashed, timed out, or its
-    /// coverage export could not be read — invalidates the whole map, not
-    /// just that one test's own entry. A version of this method that
-    /// `continue`d past such a test, returning whatever the *successful*
-    /// tests alone had built, produces a map that still looks complete and
-    /// usable while silently missing the unprovable test's real coverage —
-    /// if another test also covers the same line, that line stays
-    /// non-empty and never falls back to the full suite, so a mutant only
-    /// the unprovable test would have killed can be scored against the
-    /// wrong, narrower selection and turn into a false survivor. A test that
-    /// legitimately covers nothing is not this failure class, but is not
-    /// distinguished from it today either: `XccovCoverageReader.read` itself
-    /// conservatively folds a validly-parsed, genuinely-empty export into
-    /// the same `nil` a malformed one produces (see its own doc comment),
-    /// so this loop's `guard ... let map = ... else { return nil }` below
-    /// invalidates the whole map for that test too — safe (a fallback to
-    /// the full suite is never wrong, only slower), just not the narrowest
-    /// correct behavior; sharpening it is a performance question for later.
+    /// The retry, and what becomes of a test that still cannot be proven,
+    /// are `PerTestCoverageAttribution.attribute`'s — see its doc comment,
+    /// and `PerTestCoverageMap`'s, for the policy and why it is safe. One
+    /// thing specific to this adapter: a test that legitimately covers
+    /// nothing is not distinguished from one that could not be measured,
+    /// because `XccovCoverageReader.read` conservatively folds a
+    /// validly-parsed, genuinely-empty export into the same `nil` a
+    /// malformed one produces (see its own doc comment). Such a test is
+    /// therefore treated as unattributed — safe, since that only means it is
+    /// always run, but not the narrowest correct behaviour; sharpening it is
+    /// a performance question for later.
     /// - Parameter artifact: `runBaseline`'s own, uninstrumented artifact —
     ///   kept only to enumerate test identifiers from its already-produced
     ///   bundle; never built or tested against directly. Per-test coverage
@@ -1455,28 +1512,31 @@ extension XcodeBuildAdapter: TestSelecting {
 
         guard let coverageArtifact = try? await build(in: workspace, enableCoverage: true) else { return nil }
 
-        var coveringTests: [String: [Int: Set<TestIdentifier>]] = [:]
-        for test in tests {
+        // The loop, the retry policy and what becomes of a test that cannot
+        // be proven are all `PerTestCoverageAttribution.attribute`'s — see
+        // its doc comment. What is adapter-specific, and all that is left
+        // here, is how one test is run and how its coverage is read back.
+        return await PerTestCoverageAttribution.attribute(
+            tests: tests, source: "xcodebuild-xccov-per-test",
+            progress: ProgressReporter(total: tests.count, label: "per-test coverage")
+        ) { test, attempt in
             guard let run = try? await runTests(
                 artifact: coverageArtifact,
                 in: workspace,
-                label: "pertest-\(test.onlyTestingArgument)",
+                // Distinct per attempt: a retry that reused the first
+                // attempt's bundle path would be read against whatever the
+                // failed attempt left behind, which is precisely the
+                // half-written state being retried past.
+                label: attempt == 1
+                    ? "pertest-\(test.onlyTestingArgument)"
+                    : "pertest-retry\(attempt)-\(test.onlyTestingArgument)",
                 timeoutSeconds: timeoutSeconds,
                 testFilters: [test.onlyTestingArgument],
                 enableCoverage: true
             ) else { return nil }
             guard run.status == .passed, let bundle = run.resultArtifactPath else { return nil }
-
-            guard let map = await XccovCoverageReader.read(archive: bundle, projectRoot: workspace) else { return nil }
-            for (file, lines) in map.executedLines {
-                for line in lines {
-                    coveringTests[file, default: [:]][line, default: []].insert(test)
-                }
-            }
+            return await XccovCoverageReader.read(archive: bundle, projectRoot: workspace)
         }
-
-        guard !coveringTests.isEmpty else { return nil }
-        return PerTestCoverageMap(coveringTests: coveringTests, source: "xcodebuild-xccov-per-test")
     }
 
     /// Walks `xcresulttool get test-results tests` for one bundle, pulling
