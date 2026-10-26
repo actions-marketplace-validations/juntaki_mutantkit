@@ -13,7 +13,7 @@ public struct OperationalIssue: Codable, Sendable, Hashable {
     /// Five cases today, plus a partial per-test coverage attribution:
     /// `MutationRunner.finalize`'s checkpoint write, a
     /// shared schemata chunk build that genuinely failed to compile
-    /// (ADR-0008 Addendum 4's fan-out/observability requirement — one issue
+    /// (shared chunk build-failure attribution's fan-out/observability requirement — one issue
     /// per failed chunk, never one per affected `MutationID`), a chunk whose
     /// build succeeded but whose own build receipt could not be resolved,
     /// and a `noOpCanarySampleRate`-sampled mutant whose build product
@@ -52,6 +52,16 @@ public struct OperationalIssue: Codable, Sendable, Hashable {
         /// pass as a whole, never per affected test, mirroring
         /// `schemataChunkBuildFailed`'s one-per-chunk rule.
         case perTestCoverageIncomplete
+        /// The opt-in evidence archive could not be written (an observation
+        /// file, or the manifest). Never affects score, integrity or any
+        /// verdict; results without an archived observation simply cannot be
+        /// re-verified offline.
+        case evidenceArchiveWriteFailed
+        /// The evidence archive covers fewer results than the report holds:
+        /// results resumed from a checkpoint, served from the cross-run cache
+        /// or embedded by the schemata strategy have no observations to
+        /// archive in this run.
+        case evidenceArchiveIncomplete
     }
 
     public let severity: Severity

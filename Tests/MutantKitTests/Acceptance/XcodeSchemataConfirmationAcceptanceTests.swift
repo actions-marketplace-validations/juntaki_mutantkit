@@ -7,7 +7,7 @@ import SwiftCoreOperators
 import SwiftFrontend
 import Testing
 
-/// ADR-0006 Stage 3: the Xcode half of `SchemataConfirmationAcceptanceTests`
+/// The re-enabled schemata scoring: the Xcode half of `SchemataConfirmationAcceptanceTests`
 /// — proves schemata confirmation end to end against a real
 /// `xcodegen`-generated macOS framework + unit-test bundle. Unlike the
 /// SwiftPM adapter, `XCResultAdapter` reads a structured `Crash:` field
@@ -142,7 +142,7 @@ struct XcodeSchemataConfirmationAcceptanceTests {
         let originalSources = [Self.relativePath: Data(Self.librarySource.utf8)]
 
         let adapter = XcodeBuildAdapter(
-            configuration: Configuration(), kind: .xcodeProject, projectFile: projectFile, projectRoot: directory
+            configuration: Acceptance.macOSConfiguration(), kind: .xcodeProject, projectFile: projectFile, projectRoot: directory
         )
         let workspaces = try WorkspaceManager(projectRoot: directory, scratchRoot: scratchRoot)
         let policy = MutationVerdictVerifier.VerdictVerificationPolicy(

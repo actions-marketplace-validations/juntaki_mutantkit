@@ -25,7 +25,7 @@ import Testing
 /// cover. A macOS unit test target, not iOS Simulator, on purpose — it
 /// isolates the linker-injection question from simulator-specific concerns
 /// (code signing, device boot, dyld image loading inside a sandboxed
-/// simulator) that ADR-0003 explicitly calls out as separate, harder,
+/// simulator) that the schemata evidence contract explicitly calls out as separate, harder,
 /// still-open problems.
 ///
 /// Off by default like every other acceptance suite (`xcodegen generate`
@@ -328,7 +328,8 @@ struct SchemataXcodeRuntimeAcceptanceTests {
         }.first, "a real xctest process, whose PID this host never predicted, must still leave a startup event")
         #expect(startup.compilationUnitID == Self.compilationUnitID)
         let hit = try #require(transcript.records.compactMap { record -> RuntimeHitEvent? in
-            guard case let .hit(event) = record, event.token == staged.token, event.runID == startup.runID, event.processID == startup.processID
+            guard case let .hit(event) = record, event.token == staged.token,
+                  event.runID == startup.runID, event.processID == startup.processID
             else { return nil }
             return event
         }.first, "and a hit from that same process")

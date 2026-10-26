@@ -3,11 +3,7 @@ import MutationModel
 import SwiftFrontend
 import Testing
 
-/// Scenario numbers in test names/comments match
-/// this project's internal side-effect-call-removal operator-catalog
-/// design document's (not part of this public repo) own
-/// "RED test scenarios" section exactly, so a failure here can be traced
-/// back to the exact design paragraph it tests.
+/// Scenario numbers in test names and comments identify the RED scenarios.
 @Suite("RED: side-effect call removal operator")
 struct SideEffectCallRemovalOperatorREDTests {
     private let operatorID = "swift.core.side-effect-call-removal"
@@ -284,7 +280,10 @@ struct SideEffectCallRemovalOperatorREDTests {
 /// Split from the main suite above purely to keep that struct's body under
 /// SwiftLint's `type_body_length`; same suite in spirit.
 extension SideEffectCallRemovalOperatorREDTests {
-    @Test("Rule 2 extension (codex finding): a trailing call to a custom, non-stdlib Never-returning function in a multi-statement non-Void body is not a candidate")
+    @Test("""
+    Rule 2 extension (codex finding): a trailing call to a custom, non-stdlib Never-returning function \
+    in a multi-statement non-Void body is not a candidate
+    """)
     func trailingCustomNeverReturningCallInMultiStatementBodyExcluded() throws {
         let source = """
         func customNeverHelper() -> Never {
@@ -506,7 +505,10 @@ extension SideEffectCallRemovalOperatorREDTests {
         #expect(!points.contains { $0.originalText == "print(\"debug\")" })
     }
 
-    @Test("Scenario 17: the sole statement of a closure literal with no explicit return type, in a non-Void-inferred context, is not a candidate")
+    @Test("""
+    Scenario 17: the sole statement of a closure literal with no explicit return type, in a \
+    non-Void-inferred context, is not a candidate
+    """)
     func scenario17SoleStatementOfUnannotatedClosureInNonVoidContextExcluded() throws {
         let source = """
         func run() {
@@ -565,9 +567,7 @@ extension SideEffectCallRemovalOperatorREDTests {
         #expect(points.contains { $0.originalText == "sideEffect()" })
     }
 
-    /// Operator-exclusion-soundness audit
-    /// (this project's internal operator-catalog exclusion-policy
-    /// document, not part of this public repo): the
+    /// Operator-exclusion-soundness audit: the
     /// coarseness `Sources/MutationModel/Configuration.swift`'s own doc
     /// comment already admits for `excludeCalls` ("Doesn't support
     /// overloading currently — all function calls with a matching name will

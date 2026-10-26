@@ -12,15 +12,18 @@ A mutant is one small, deliberate change to your source — a `<` flipped to
 syntax alone proves is safe. MutantKit builds and tests a copy of your
 project with that one change applied, and classifies what happened:
 
-- **`survived`** — the tests ran, covered the mutated line, and all passed
-  anyway. This is the real finding: some test that exercises this code path
+- **`survived`** — the mutation reached the build product, the tests ran,
+  and all passed anyway. With coverage measured
+  (`execution.selectCoveringTests`) the mutated line was also executed by a
+  test; without it `noCoverage` is not evaluated, so a survivor may sit on
+  code no test executes. This is the real finding: some test that exercises this code path
   never actually asserted on the behavior the mutation changed. Line
   coverage cannot show this — a line can run inside a test with nothing
   checking what it produced. Precisely: **a test that still passes after a
   relevant behavior is mutated did not detect that particular fault** — it
   may well be exercising other properties of the same code perfectly well.
 - **`noCoverage`** — the tests passed, but nothing ran the mutated line at
-  all. A coverage gap, not a suite-quality gap, and scored separately
+  all. Reported only when coverage is measured. A coverage gap, not a suite-quality gap, and scored separately
   (below) rather than folded into `survived`.
 - **`notApplied` / `baselineMismatch` / `infrastructureFailure`** — the run
   itself has a problem (a stale source anchor, an unmutated baseline that
@@ -32,6 +35,16 @@ project with that one change applied, and classifies what happened:
   one unprovable mutant from the score (`MutationScore.excluded`) without
   failing the rest of the run, since one orphaned source file or one flaky
   toolchain hiccup should not discard every other mutant's real evidence.
+- **`notMaterialized`** — the edit was applied and the build succeeded, but
+  the mutant's build product is identical to the baseline's, so the mutation
+  did not reach the product the tests run against (code compiled out by
+  conditional compilation such as `#if !canImport(Darwin)`, dead-stripped,
+  or optimized away). Nothing ran against a mutation, so it is neither a
+  survivor nor an equivalent-mutant claim, and it is not an infrastructure
+  failure either: the observation is complete. It is in no score numerator
+  or denominator, is counted in `MutationScore.excluded`, and the tests are
+  not run for it. The reason it did not materialize is deliberately not part
+  of the verdict.
 
 ## Two scores, never one
 
@@ -92,7 +105,6 @@ The Mutation Plan is plain JSON and is the only source of truth. Mutations
 are anchored to UTF-8 byte ranges and content hashes, never to SwiftSyntax
 node identity — so re-parsing is harmless, discovery can drop every AST it
 reads, and plans survive sharding, resuming and reproduction.
-([ADR-0002](../ADR/0002-the-mutation-plan-is-the-source-of-truth.md))
 
 ## A stale anchor is a diagnosis, not a corruption
 

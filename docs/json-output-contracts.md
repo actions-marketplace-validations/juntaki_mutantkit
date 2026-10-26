@@ -10,7 +10,7 @@ exit-code/stdout/stderr contract.
 **A new optional field is non-breaking. A new required field, or a removed,
 renamed, or retyped field, is breaking.** This has been the lived practice
 throughout this codebase's history — every schema-version bump on record
-(e.g. `schemataPlan` going from 1 to 2 for ADR-0005 PR F, when
+(e.g. `schemataPlan` going from 1 to 2, when
 `SchemataPlacement.embedded` changed from a flat set of fields to a list of
 per-target placements) corresponds to exactly this kind of incompatible
 change, and every other addition (`RunReport.batchExecution`,
@@ -34,6 +34,10 @@ throw rather than guess. Not every type checks its own `schemaVersion` at
 decode time today; where a reader path doesn't check it, that is a decoding
 convenience, not a claim that a version mismatch there is safe.
 
+`RunReport` readers accept every version from 1 up to the current one, so a
+`report.json` written by an older release still loads. A tool older than the
+report cannot read it: version 2 adds the `notMaterialized` outcome.
+
 ## Registry
 
 Every constant below is declared in `Sources/MutationModel/CoreTypes.swift`,
@@ -45,11 +49,11 @@ each carry their own `schemaVersion` — see
 | Constant | Value | Produced by | Top-level shape |
 | --- | --- | --- | --- |
 | `plan` | 1 | `plan.json` (written by `mutantkit plan`/`run`/`dry-run`) | object |
-| `result` | 1 | `report.json` (written by `mutantkit run`), a.k.a. `RunReport` | object |
+| `result` | 2 | `report.json` (written by `mutantkit run`), a.k.a. `RunReport` | object |
 | `schemataPlan` | 2 | The schemata-mode execution plan (`SchemataPlan`), internal to schemata execution | object |
 | `agentEvidenceReport` | 1 | `mutantkit inspect --json` (`AgentEvidenceReport`) | object |
 | `runHistoryRecord` | 1 | `mutantkit history --json` (`RunHistoryRecord`) | **bare array**, per-element `schemaVersion` |
-| `operatorCatalogEntry` | 1 | `mutantkit operator-catalog --json` (`OperatorCatalogEntry`) | **bare array** with no operator ID given (per-element `schemaVersion`); a single **object** when an operator ID is given |
+| `operatorCatalogEntry` | 2 | `mutantkit operator-catalog --json` (`OperatorCatalogEntry`) | **bare array** with no operator ID given (per-element `schemaVersion`); a single **object** when an operator ID is given |
 | `qualityGateResult` | 1 | `mutantkit gate --json` (`QualityGateResult`) | object |
 | `buildDiagnosis` | 1 | `mutantkit doctor --json` (`BuildDiagnosis`) | object |
 | `configurationValidationResult` | 1 | `mutantkit config --json` (`ConfigurationValidationResult`) | object |
@@ -57,7 +61,146 @@ each carry their own `schemaVersion` — see
 | `testObligationFixPlan` | 1 | `mutantkit fix-plan --json` (`TestObligationFixPlan`) | object |
 | `nextFixRecommendation` | 1 | `mutantkit next --json` (`NextFixRecommendation`) | object |
 | `verifyResult` | 1 | `mutantkit verify --json` (`VerifyResult`) | object |
+| `verifyRunResult` | 1 | `mutantkit verify-run --json` (`VerifyRunResult`) | object |
 | `commandError` | 1 | Every `--json`-supporting command's failure path (`JSONErrorEnvelope`) | object |
+
+`trust --json` carries an optional `verification` object (the re-verification
+`trust` runs internally: `planSupplied`, `planSource`, `planPath`, `passCount`,
+`failCount`, `notVerifiableCount`, `unverifiedRequiredChecks`, `checks`).
+`trustworthy` is fail-closed: `true` only when the stored `integrity.passed` is
+true, no check failed, and every required check (`report.results`,
+`plan.identity`, `plan.mutationIDs`, `result.identity`, `result.provenance`,
+`integrity.recompute`, `score.recompute`) was verifiable and passed. The new
+`trustStatus` says which case applies: `trustworthy`, `mismatch` (a check
+failed, or the stored integrity did not pass; exit code `2`) or
+`notFullyVerified` (nothing failed but a required check could not be verified,
+named in `verification.unverifiedRequiredChecks`; exit code `5`). Without
+`--plan`, `trust` first looks for a `plan.json` with the report's `planID` next
+to the report and in the project root; if none is found, the plan-dependent
+checks are not verifiable and a clean report is `notFullyVerified`, never
+`trustworthy`. A mismatch outranks `notFullyVerified`. A report whose results were verified by an
+older verifier version than the current one is also `notFullyVerified` (exit
+code `5`), even with `--plan`: `result.provenance` is then not verifiable,
+because a report cannot be re-judged without its observations. The required
+checks are not relaxed for it; `trust` prints "report was produced by an older
+verifier" with the versions and says to re-run for a verifiable report.
+`trustworthy` therefore means "every required check re-verified". That is a
+semantic tightening of the existing key: a report that earlier versions called
+trustworthy can now be `false` when it carries older-verifier results. `planSource` is
+`supplied`, `discovered` or `none`. Not-verifiable checks are never counted as
+passed. `score` is withheld on a `mismatch`; on `notFullyVerified` it is the
+stored value and unverified. Existing keys are unchanged.
+
+`verify-run --json` and `trust --json`'s `verification` object carry
+`complete`, an additive boolean that is `true` only when every check passed:
+none failed and none is not verifiable. `passed` keeps its meaning (no check
+failed), so `passed: true, complete: false` is a PARTIAL verification, and the
+`verify-run` text output ends with `PARTIAL: ...` instead of
+`Fully verified: every check passed.` A partial report must never be read as
+fully verified.
+
+Completeness is split explicitly, additively and optionally (older output
+omits these keys). `tierAComplete` is computed from the report-only (Tier A)
+checks alone: every check the report alone can run passed. `complete` is
+unchanged and covers every check, including the `archive.*` / `tierB.*` checks
+that reading an evidence archive adds, so the two differ exactly when an
+archive was read. A schemata run whose activation facts need the raw evidence
+archive is legitimately `passed: true, tierAComplete: false` and still
+trustworthy.
+`fullEvidenceReverified` is `true` only when an evidence archive was read and
+every result was re-judged from raw observations with no mismatch, no result
+lacking usable observations, no archive problem and no failed check. The two
+are independent: Tier A partial with `fullEvidenceReverified: true` is the
+expected state for a schemata run with a complete bound archive. Neither field
+changes which checks pass or fail. The `verify-run` text output reports both
+("Tier A ... complete/partial. Full-evidence re-verification (Tier B): yes/no").
+
+`verify-run --json` also carries an optional `executionStrategy`: the bound
+report's `executionStrategy` copied verbatim (`requested`, `effectiveCount`,
+`fallbackCount`, `degradationReason`, dynamic `fallbackReasonCounts` and
+planner-time `plannerFallbackReasonCounts`). `report.json` is the authoritative
+artifact for execution provenance; verify-run adds no interpretation of its own.
+Treat report + verify-run as one required pair: an all-fallback run has
+`effectiveCount: 0` and is not schemata-qualified merely because its isolated
+verdicts verify. It is absent for a plain isolated run or an older report.
+
+`verify-run --json` and `trust --json` report `tierBPerformed: true` only when
+an evidence archive (written by a run with `evidence.archive: true`) was read
+and at least one result was re-judged from its raw observations under the
+confirmation policy the run recorded; a `tierB` object then gives the counts.
+`report.json` gains an optional `evidenceArchive` (`runID`, `manifestHash`,
+`entryCount`); `--evidence <dir>` selects an archive explicitly. Without an
+archive both commands behave as before and results that need raw observations
+stay not verifiable. The archive's hashes show an edited archive is not the one
+the run wrote; they are not a signature.
+
+Tier B is a consistency check with two explicit limits. An archive passed with
+`--evidence` for a report that records no `evidenceArchive` is an unbound
+archive: only its own consistency is checked (`archive.binding` is not
+verifiable), nothing is re-judged from it and `tierBPerformed` stays `false`.
+And the confirmation policy Tier B re-judges under is read from the archive's
+own manifest. When a project configuration whose `configurationHash` equals the
+plan's is available, the policy it implies is compared with the manifest's and a
+disagreement fails `archive.policy`; otherwise `archive.policy` is not
+verifiable ("policy taken from the archive itself, not independently bound").
+No Tier B check is among the required checks, so a Tier B pass never makes a
+report `trustworthy` on its own.
+
+`trust --json` also carries an optional `killEvidence` object counting how
+the assertion kills were credited (`withinSelection`, `wholeSuiteRan`,
+`failingTestsUnnamed`, `attributionNotRecorded`, `batchAttributed`) and how many
+results went through more than one confirmation round
+(`cascadeConfirmations`). It also carries two optional, diagnostic-only
+lists derived from the recorded failing tests of assertion kills (no new
+store): `killingTests`, the top 10 tests by number of killed mutants
+(`test`, `mutantCount`, `fileCount`, `soleFailingCount`, `notConfirmedCount`,
+`shareOfKills`), and `suspectTests`, the rows with at least 10 mutants across at
+least 5 distinct files (constants in `TrustReport.KillingTestThresholds`), each
+with `warning: "broad-failing/suspect test — confirm with the baseline
+control"`. A broad end-to-end test can legitimately kill widely; this is never
+proof of flakiness and never changes a verdict, the score or the trust status.
+`trust` prints the same table and warnings. In `report.json`, a result's `evidence` may carry
+`assertionKillAttribution` and `confirmationChain`, both optional and both
+written only by the verifier; a result without them is never read as one whose
+kill stayed inside its test selection. A verifier version bump (13) means a
+cached or checkpointed assertion kill whose observation recorded no test
+execution is re-verified and is no longer credited as a kill.
+
+With `retestKilledMutants` on, a confirmed assertion kill's
+`assertionKillConfirmation` also carries an optional `control` (`status`:
+`passedOnBaseline`, `failedOnBaseline` or `notEstablished`, the `method`, the
+control run's status and failing tests): the unmutated build run against the
+same tests. A kill is confirmed only with `passedOnBaseline`; a failing control
+makes the result `flaky` (disposition `baselineControlFailed`) and a missing or
+unusable one makes it `infrastructureFailure` (`baselineControlNotEstablished`).
+A record without `control` is unknown, never controlled, and `verify-run`
+reports it as not verifiable (older result) or failed (current rules). The
+evidence archive stores the control run with the observations, so Tier B
+re-derives the same status. A verifier version bump (14) means an older cached
+or checkpointed kill is re-verified and, lacking a control, is no longer
+credited as a kill.
+
+Whether a failing test lies inside the run's selection is decided from the full
+test identifier (target, suites, type, method and parameter list), not its last
+two path components: a failing test that only shares a type and method name
+with a selected one (another target or enclosing suite, another overload or
+parameterized variant) is not inside the selection. A tolerated difference is
+only decoration (a trailing `()`, a missing target or suite prefix, a module
+prefix on the type). The kill then becomes `infrastructureFailure` with
+`assertionKillAttribution.disposition` `outsideSelection` and the names in
+`unmatchedFailingTests`, visible in `trust`'s `killEvidence`. A verifier version
+bump (15) means an older cached kill is re-verified under this rule. Version
+16 reads a Swift Testing selection recorded with a doubled trailing `()` as the
+same test.
+
+Every result records the `verificationVersion` of the verifier that judged it.
+A cached result from an earlier version is never served: the cache treats it as
+a miss and the mutant is run again. A resumed checkpoint is re-judged from its
+raw observations under the current rules, never taken as stored. A result in a
+finished report keeps the version it was judged under, which is why `trust`
+cannot call an older report `trustworthy` (exit code `5`) and a fresh run is
+needed. None of this changes a stored report's contents or can produce a wrong
+result: the worst case is a re-run.
 
 Two more `--json` outputs exist outside this registry, both intentionally:
 
@@ -68,6 +211,18 @@ Two more `--json` outputs exist outside this registry, both intentionally:
   other command's output allows.
 - `mutantkit inspect --json` on its not-found path (`InspectCommand.ErrorJSON`)
   — see [Legacy exception](#legacy-exception-inspects-errorjson) below.
+
+## `operatorCatalogEntry` v2
+
+`reachableProfile` changed meaning, not shape. v1 reported the profile names
+of the v1.x configuration (`conservative`, `default`, `experimental`); v2
+reports the most restrictive canonical tier that reaches the operator:
+`default`, `stronger` or `all` (or `null` for an operator no profile can
+reach). `conservative` and `experimental` are never emitted, although
+`operators.profile` still accepts them. A reader that decodes the field as a
+closed enum, or compares it with v1 names, must handle the new values. Nothing
+else changed: `Configuration.version`, the `plan` and `result` schemas,
+operator versions and mutation IDs are untouched.
 
 ## Array-vs-object exception
 

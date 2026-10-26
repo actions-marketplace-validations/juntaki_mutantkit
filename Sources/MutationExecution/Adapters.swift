@@ -81,6 +81,9 @@ public struct DiagnosisItem: Codable, Sendable {
         case sharedModuleCache
         case macOSVersionFloor
         case schemataExecutionSupport
+        /// Whether the schemata runtime archive a schemata build links against can be
+        /// found and trusted (bundled and digest/ABI-checked, or an explicit developer override).
+        case schemataRuntime
         case perTestCoverageSupport
         case testBatchingSupport
     }
@@ -153,7 +156,7 @@ public protocol SchemataBuildable: BuildAdapter {
 
     /// Builds the real, per-compilation-unit build receipt for everything
     /// `buildSchemataChunk` just produced — the build-time half of
-    /// ADR-0006's proof chain (Finding 2/4). Every `unit` in `units` names
+    /// The end-to-end trust chain's proof chain (image identity and unit-to-image mapping). Every `unit` in `units` names
     /// its own real `BuildTargetIdentity` (the chunk planner's own
     /// project/target/module identity, never a name this method has to
     /// guess at); this method's job is only to prove which real built
@@ -210,7 +213,7 @@ public struct SchemataCompilationUnitTargetRequest: Sendable {
 
 //
 // TestRunStatus/TestRunResult/BuildFailureKind/BuildFailure moved to
-// MutationModel/TestObservation.swift (ADR-0006 Stage 1) — the verifier
+// MutationModel/TestObservation.swift (the authoritative verdict pipeline) — the verifier
 // needs to inspect them directly and cannot depend on this module.
 
 public protocol TestAdapter: Sendable {
@@ -236,7 +239,7 @@ public protocol TestAdapter: Sendable {
 /// Xcode's `.xctestrun`-based lookup — fully self-contained inside the flat
 /// products clone `WorkspaceManager.cloneProducts` already produces, nothing
 /// downstream of it ever looks outside that directory (see
-/// `XcodeBuildAdapter.productsDirectory(in:)`) — SwiftPM needs to resolve a
+/// `XcodeBuildDriver`'s own `productsDirectory(in:)`) — SwiftPM needs to resolve a
 /// real package graph (`Package.swift`, plus the real target source
 /// directories) to find which pre-built `.xctest` bundle a test target maps
 /// to, even though it is never going to compile anything (`--skip-build`).
@@ -372,9 +375,26 @@ public protocol TestAdapterWrapping: TestAdapter {
 /// begins — see `PackageManifestConfirmationRetesting
 /// .resolveDependenciesForConfirmationRetest`'s own doc comment for why.
 public func packageManifestConfirmationRetesting(for adapter: any TestAdapter) -> (any PackageManifestConfirmationRetesting)? {
-    if let direct = adapter as? any PackageManifestConfirmationRetesting { return direct }
+    testAdapterCapability((any PackageManifestConfirmationRetesting).self, for: adapter)
+}
+
+/// Resolves `adapter`'s conformance to `P`, unwrapping through any
+/// `TestAdapterWrapping` layer first — the generalized form of
+/// `packageManifestConfirmationRetesting(for:)` above (now a one-line caller
+/// of this). Kept as its own named function too: call sites that only need
+/// that one capability, and existing doc comments/call sites that name it,
+/// stay unchanged.
+///
+/// Recursive by construction, identically to
+/// `packageManifestConfirmationRetesting(for:)`'s own original body: a chain
+/// of wrappers unwraps one layer at a time until a conforming adapter is
+/// found or the chain runs out. See `TestAdapterWrapping`'s doc comment for
+/// why a plain `adapter as? P` cannot do this by itself when `adapter` is a
+/// wrapper storing its wrapped value as an existential.
+public func testAdapterCapability<P>(_ type: P.Type, for adapter: any TestAdapter) -> P? {
+    if let direct = adapter as? P { return direct }
     if let wrapping = adapter as? any TestAdapterWrapping {
-        return packageManifestConfirmationRetesting(for: wrapping.wrappedTestAdapter)
+        return testAdapterCapability(type, for: wrapping.wrappedTestAdapter)
     }
     return nil
 }
@@ -622,6 +642,20 @@ public protocol ProjectAdapter: Sendable {
     var build: any BuildAdapter { get }
     var test: any TestAdapter { get }
 
+    /// The following six properties surface `build`/`test`'s own optional
+    /// capability-protocol conformances as facts resolved once, at
+    /// construction, from a concrete adapter type's compile-time-known
+    /// conformance — never a runtime `as?`/`is` cast at the call site. `nil`
+    /// for every adapter that does not conform to the capability in
+    /// question (mirroring `prepareSimulatorForRun()`'s own existing
+    /// defaulted-no-op pattern below).
+    var schemataBuild: (any SchemataBuildable)? { get }
+    var schemataTest: (any SchemataTestable)? { get }
+    var coverageMeasuring: (any CoverageMeasuring)? { get }
+    var testSelecting: (any TestSelecting)? { get }
+    var batchTestable: (any BatchTestable)? { get }
+    var schemataBatchTestable: (any SchemataBatchTestable)? { get }
+
     /// Boots and verifies readiness of whatever simulator this run's tests
     /// will execute on, if any. Called once at run start; a no-op
     /// `.notApplicable` for adapters whose destination is not a simulator.
@@ -632,6 +666,13 @@ public protocol ProjectAdapter: Sendable {
 }
 
 public extension ProjectAdapter {
+    var schemataBuild: (any SchemataBuildable)? { nil }
+    var schemataTest: (any SchemataTestable)? { nil }
+    var coverageMeasuring: (any CoverageMeasuring)? { nil }
+    var testSelecting: (any TestSelecting)? { nil }
+    var batchTestable: (any BatchTestable)? { nil }
+    var schemataBatchTestable: (any SchemataBatchTestable)? { nil }
+
     func prepareSimulatorForRun() async -> SimulatorPreparationRecord {
         SimulatorPreparationRecord(outcome: .notApplicable)
     }

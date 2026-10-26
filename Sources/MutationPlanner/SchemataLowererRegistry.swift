@@ -6,7 +6,7 @@ import SwiftFrontend
 /// "which lowerer handles this operator" a well-defined question before
 /// `SchemataChunkPlanner` ever has to ask it.
 ///
-/// Deferred at S1 (ADR-0003 addendum 1) until a second lowerer existed to
+/// Deferred at S1 (the schemata evidence contract addendum 1) until a second lowerer existed to
 /// make a registry meaningful — this is that moment.
 public struct SchemataLowererRegistry: Sendable {
     /// The lowerers compiled into this build — the entire per-operator
@@ -48,7 +48,8 @@ public struct SchemataLowererRegistry: Sendable {
         LogicalConnectorReplacementSchemataLowerer(),
         UnaryNotRemovalSchemataLowerer(),
         ReturnValueReplacementSchemataLowerer(),
-        TernaryBranchSwapSchemataLowerer()
+        TernaryBranchSwapSchemataLowerer(),
+        NilCoalescingFallbackSchemataLowerer()
     ]
 
     public enum RegistrationError: Error, Equatable, CustomStringConvertible {

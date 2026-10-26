@@ -98,7 +98,40 @@ enum Acceptance {
             try? FileManager.default.removeItem(at: destination.appendingPathComponent(stale))
         }
 
+        try retargetPinnedSimulator(inFixtureAt: destination)
         return destination
+    }
+
+    /// Configuration for the generated macOS-only framework projects. Their
+    /// schemes have no iOS destination, so the iOS Simulator default every other
+    /// Xcode configuration falls back to would fail with "unable to find a
+    /// destination" on any machine, whatever runtimes it has.
+    static func macOSConfiguration() -> Configuration {
+        var configuration = Configuration()
+        configuration.project.destination = "platform=macOS"
+        return configuration
+    }
+
+    /// A fixture's own `mutantkit.yml` pins a simulator model for readers. That
+    /// model exists only under some runtimes, so a machine with several
+    /// installed runtimes can legitimately refuse it (`doctor` refuses to run
+    /// against a different runtime than the one it resolves). The staged copy
+    /// gets a destination this machine can satisfy instead; the checked-in
+    /// fixture is untouched, and a machine without any simulator keeps the pin.
+    private static func retargetPinnedSimulator(inFixtureAt directory: URL) throws {
+        let configurationURL = directory.appendingPathComponent("mutantkit.yml")
+        guard let text = try? String(contentsOf: configurationURL, encoding: .utf8),
+              text.contains("destination: platform=iOS Simulator,"),
+              let resolved = try? iPhoneDestination()
+        else { return }
+
+        let lines = text.components(separatedBy: "\n").map { line -> String in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("destination: platform=iOS Simulator,") else { return line }
+            let indent = line.prefix { $0 == " " }
+            return "\(indent)destination: \(resolved)"
+        }
+        try Data(lines.joined(separator: "\n").utf8).write(to: configurationURL, options: .atomic)
     }
 
     /// A simulator destination this machine can actually satisfy.
@@ -344,7 +377,21 @@ struct AcceptanceRun {
         plannerFallbackReasonCounts: \(strategy?.plannerFallbackReasonCounts ?? [:])
         operationalIssues:
         \(issues.isEmpty ? "  (none)" : issues.joined(separator: "\n"))
+        console:
+        \(consoleEvidence)
         """
+    }
+
+    /// The lines of the plan and run console output that explain how the
+    /// schemata backend was used: the `!` warning lines (for instance the one
+    /// printed when target resolution or chunk planning fails and the run
+    /// degrades) and every line that mentions schemata. A whole-run
+    /// degradation can be absent from the report's own fields, so without
+    /// these the failure message cannot say why the backend degraded.
+    var consoleEvidence: String {
+        let lines = (planOutput + "\n" + runOutput).split(separator: "\n", omittingEmptySubsequences: true)
+            .filter { $0.hasPrefix("!") || $0.localizedCaseInsensitiveContains("schemata") }
+        return lines.isEmpty ? "  (no warning or schemata lines in the console output)" : lines.map { "  \($0)" }.joined(separator: "\n")
     }
 
     /// The same idea for the other way this bar fails: a baseline that did
@@ -353,7 +400,7 @@ struct AcceptanceRun {
     /// red" from "nothing ran at all", none of which a bare
     /// `#expect(baseline.passed)` failure prints.
     var baselineEvidence: String {
-        "baseline: \(report.baseline)\ndegradationReason: \(report.executionStrategy?.degradationReason ?? "nil")"
+        "baseline: \(report.baseline)\ndegradationReason: \(report.executionStrategy?.degradationReason ?? "nil")\nconsole:\n\(consoleEvidence)"
     }
 
     func cleanUp() {

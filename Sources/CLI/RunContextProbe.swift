@@ -69,7 +69,7 @@ enum RunContextProbe {
         _ executable: String, _ arguments: [String], _ workingDirectory: URL, _ timeoutSeconds: Double
     ) async throws -> ProcessResult
 
-    private static let defaultProcessRunner: ProcessRunner = { executable, arguments, workingDirectory, timeoutSeconds in
+    static let defaultProcessRunner: ProcessRunner = { executable, arguments, workingDirectory, timeoutSeconds in
         try await ProcessSupervisor.run(
             executable: executable, arguments: arguments, workingDirectory: workingDirectory, timeoutSeconds: timeoutSeconds
         )
@@ -90,27 +90,27 @@ enum RunContextProbe {
     /// config) happens to still match.
     static let classificationRulesVersion = 2
 
+    /// The checkpoint fingerprint of `inputState` under this configuration,
+    /// toolchain and work unit.
+    ///
+    /// `inputState` is the run's one `RunInputState`, computed once by the
+    /// caller; the result-cache and coverage-cache digests hash the same
+    /// value.
     static func compute(
-        projectRoot: URL,
+        inputState: RunInputState,
         configuration: Configuration,
         toolchain: ToolchainFingerprint,
         workUnitID: String,
-        toolchainCacheIdentityComplete: Bool = true,
-        processRunner: ProcessRunner = defaultProcessRunner
-    ) async throws -> RunContextFingerprint {
-        // Checked before the (possibly slow) git work below: a caller that
-        // already knows its `toolchain` was built from an incomplete probe
-        // gains nothing from computing a worktree digest just to discard it.
+        toolchainCacheIdentityComplete: Bool = true
+    ) throws -> RunContextFingerprint {
         // See `RunContextProbeError.incompleteToolchainIdentity` and
-        // `ToolchainProbeResult.identityEvidenceComplete`'s own doc comments —
-        // this is the identical fail-closed treatment `worktreeContentState`
-        // below already gives a `git` invocation whose own output could not
-        // be confirmed complete, applied to the other half of what this
-        // fingerprint hashes.
+        // `ToolchainProbeResult.identityEvidenceComplete`'s own doc comments:
+        // a toolchain identity whose probe output could not be confirmed
+        // complete gets the same fail-closed treatment `worktreeContentState`
+        // gives a `git` invocation whose output could not be.
         guard toolchainCacheIdentityComplete else {
             throw RunContextProbeError.incompleteToolchainIdentity
         }
-        let git = try await worktreeContentState(in: projectRoot, processRunner: processRunner)
 
         let components = [
             "classificationRulesVersion=\(classificationRulesVersion)",
@@ -122,9 +122,8 @@ enum RunContextProbe {
             "swiftSyntaxVersion=\(toolchain.swiftSyntaxVersion)",
             "xcodeVersion=\(toolchain.xcodeVersion ?? "unknown")",
             "buildSDKIdentity=\(toolchain.buildSDKIdentity ?? "unknown")",
-            "destinationRuntimeIdentity=\(toolchain.destinationRuntimeIdentity ?? "unknown")",
-            "worktreeContentState=\(git)"
-        ]
+            "destinationRuntimeIdentity=\(toolchain.destinationRuntimeIdentity ?? "unknown")"
+        ] + inputState.identityComponents
 
         return RunContextFingerprint(value: ContentHash.of(components.joined(separator: "\u{1F}")))
     }
@@ -245,7 +244,7 @@ enum RunContextProbe {
     /// coverage attribution) and `MutationResultCache` (a mutant's
     /// evaluated outcome).
     ///
-    /// Same inputs as `compute(projectRoot:configuration:toolchain:workUnitID:)`
+    /// Same inputs as `compute(inputState:configuration:toolchain:workUnitID:)`
     /// except for `workUnitID`: both coverage attribution and a mutant's
     /// outcome are properties of the source tree, test suite, and toolchain,
     /// not of which mutations happen to be planned alongside them. Two
@@ -277,6 +276,10 @@ enum RunContextProbe {
     /// scheme both purposes share, not to what makes either one's payload
     /// trustworthy.
     ///
+    /// What the run's inputs are is versioned separately, inside
+    /// `inputState` (`RunInputState.closureVersion`); the checkpoint
+    /// fingerprint folds in the same components.
+    ///
     /// ## Configuration scope
     ///
     /// `configurationScope` exists because the two purposes do not depend on
@@ -294,20 +297,17 @@ enum RunContextProbe {
     /// `ConfigurationScope.coverageAttribution` for what it keeps and the
     /// argument for each thing it drops.
     static func computeContextDigest(
-        projectRoot: URL,
+        inputState: RunInputState,
         configuration: Configuration,
         toolchain: ToolchainFingerprint,
         purpose: String,
         identityScope: IdentityScope = .wholeConfiguration,
-        toolchainCacheIdentityComplete: Bool = true,
-        processRunner: ProcessRunner = defaultProcessRunner
-    ) async throws -> String {
-        // See `compute`'s identical guard, just above, for why this is
-        // checked before doing any git work at all.
+        toolchainCacheIdentityComplete: Bool = true
+    ) throws -> String {
+        // See `compute`'s identical guard, just above.
         guard toolchainCacheIdentityComplete else {
             throw RunContextProbeError.incompleteToolchainIdentity
         }
-        let worktree = try await worktreeContentState(in: projectRoot, processRunner: processRunner)
 
         // `execution.workers` bounds chunk/mutant-level *parallelism* only —
         // it has no bearing on what a baseline build produces, what per-test
@@ -335,9 +335,8 @@ enum RunContextProbe {
             "swiftSyntaxVersion=\(toolchain.swiftSyntaxVersion)",
             "xcodeVersion=\(toolchain.xcodeVersion ?? "unknown")",
             "buildSDKIdentity=\(toolchain.buildSDKIdentity ?? "unknown")",
-            "destinationRuntimeIdentity=\(toolchain.destinationRuntimeIdentity ?? "unknown")",
-            "worktreeContentState=\(worktree)"
-        ]
+            "destinationRuntimeIdentity=\(toolchain.destinationRuntimeIdentity ?? "unknown")"
+        ] + inputState.identityComponents
 
         return ContentHash.of(components.joined(separator: "\u{1F}"))
     }
@@ -379,12 +378,18 @@ enum RunContextProbe {
     ///
     /// ## Scope
     ///
-    /// The scoped set is a superset of what a sandbox can read:
-    /// `WorkspaceManager` builds a sandbox by copying the project root minus
-    /// `defaultExcludes`, so the sandbox's files are a subset of the
-    /// worktree's non-ignored files. Equal digests therefore imply equal
-    /// bytes for every file the build and the tests can reach, which implies
-    /// an equal verdict.
+    /// This covers the project root. A sandbox also carries every local
+    /// package outside the project that the build reads; those are hashed
+    /// separately (`RunInputState.externalPackageInputs`), and every run
+    /// identity folds in both. Each external root is hashed over exactly
+    /// the entries its copy receives. The project root is hashed over its
+    /// tracked and untracked, non-ignored files, which is not the whole of
+    /// its copy: `WorkspaceManager` copies the project root minus
+    /// `defaultExcludes` and does not consult `.gitignore`, so a git-ignored
+    /// file outside those excludes (a root `.swiftpm/configuration` file
+    /// ignored by the package template, say) reaches the sandbox without
+    /// reaching this digest. Apart from such files, equal digests imply
+    /// equal bytes for every file the build and the tests can reach.
     ///
     /// The excluded-from-sandbox roots (`.build`, `DerivedData`, `Pods`, …)
     /// are deliberately **not** subtracted here even though subtracting them
@@ -402,7 +407,16 @@ enum RunContextProbe {
     /// changing the digest every run and silently defeating both caches.
     /// `.mutare/` is the prior tool name and is excluded for the same reason
     /// during any mixed-version transition.
-    static func worktreeContentState(in root: URL, processRunner: ProcessRunner = defaultProcessRunner) async throws -> String {
+    ///
+    /// `excludingProjectRelativePaths` drops named files of the project root from the digest. Only a
+    /// file whose meaning reaches every identity some other way may be named: the run's config file is
+    /// folded in as the parsed `Configuration` (narrowed per identity scope), so its raw bytes, a
+    /// comment or a key that does not apply to the identity, would only cost hit rate.
+    static func worktreeContentState(
+        in root: URL,
+        excludingProjectRelativePaths excluded: Set<String> = [],
+        processRunner: ProcessRunner = defaultProcessRunner
+    ) async throws -> String {
         // Both listings are made repository-root-relative and resolved
         // against the repository root, not against `root`. `git ls-files`
         // reports paths relative to the working directory while
@@ -418,6 +432,15 @@ enum RunContextProbe {
         // to be compared correctly.
         let tracked = try await runRaw(["ls-files", "--full-name", "-z"], in: root, processRunner: processRunner)
         let status = try await runRaw(["status", "--porcelain=v1", "--untracked-files=all", "-z"], in: root, processRunner: processRunner)
+        // Mode-160000 index entries (submodule gitlinks): `<mode> <oid> <stage>\t<path>`.
+        let staged = try await runRaw(["ls-files", "--full-name", "--stage", "-z"], in: root, processRunner: processRunner)
+        var gitlinkOIDs: [String: String] = [:]
+        for entry in staged.split(separator: "\0", omittingEmptySubsequences: true) where entry.hasPrefix("160000 ") {
+            let parts = entry.split(separator: "\t", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let fields = parts[0].split(separator: " ")
+            if fields.count >= 2 { gitlinkOIDs[String(parts[1])] = String(fields[1]) }
+        }
 
         var paths = Set<String>()
         // A path in a merge conflict is listed once per stage; the set
@@ -435,8 +458,11 @@ enum RunContextProbe {
         let toolOwnedPrefix = projectRelativePrefix(of: root, within: toplevel)
         var entries: [String] = []
         entries.reserveCapacity(paths.count)
-        for path in paths.sorted() where !isToolOwned(repositoryRelativePath: path, projectPrefix: toolOwnedPrefix) {
-            let identity = try contentIdentity(of: toplevel.appendingPathComponent(path), path: path)
+        for path in paths.sorted() where !isToolOwned(repositoryRelativePath: path, projectPrefix: toolOwnedPrefix)
+            && !isExcluded(repositoryRelativePath: path, projectPrefix: toolOwnedPrefix, excluded: excluded) {
+            let identity = try contentIdentity(
+                of: toplevel.appendingPathComponent(path), path: path, gitlinkOID: gitlinkOIDs[path]
+            )
             entries.append("\(path)=\(identity)")
         }
 
@@ -458,6 +484,12 @@ enum RunContextProbe {
         if rootPath == toplevelPath { return "" }
         guard rootPath.hasPrefix(toplevelPath + "/") else { return nil }
         return String(rootPath.dropFirst(toplevelPath.count + 1)) + "/"
+    }
+
+    private static func isExcluded(repositoryRelativePath path: String, projectPrefix: String?, excluded: Set<String>) -> Bool {
+        guard !excluded.isEmpty, let projectPrefix else { return false }
+        guard projectPrefix.isEmpty || path.hasPrefix(projectPrefix) else { return false }
+        return excluded.contains(String(path.dropFirst(projectPrefix.count)))
     }
 
     /// Tool-owned roots live under the *project* root, but git reports paths
@@ -492,7 +524,7 @@ enum RunContextProbe {
     /// A tracked path deleted from the worktree contributes `absent`, which
     /// no readable file can collide with because every other branch returns
     /// either a `sha256:`-prefixed digest or a `symlink:` prefix.
-    private static func contentIdentity(of url: URL, path: String) throws -> String {
+    static func contentIdentity(of url: URL, path: String, gitlinkOID: String? = nil) throws -> String {
         let fileManager = FileManager.default
         // `attributesOfItem` does not follow symlinks, so a symlink is
         // classified as one rather than as whatever it resolves to.
@@ -515,15 +547,32 @@ enum RunContextProbe {
             }
             return hash
         case .typeDirectory:
-            throw RunContextProbeError.unprovableWorktreeContent(
-                path: path,
-                reason: "tracked path is a directory — a submodule, whose contents this digest does not read"
-            )
+            // A submodule: the recorded commit (gitlink OID) plus every byte the sandbox copy of the
+            // subtree carries. The OID alone would miss an initialized submodule's dirty or untracked
+            // files; the subtree alone would not tell an uninitialized checkout from an empty one.
+            return "gitlink:\(gitlinkOID ?? "none"):" + (try subtreeIdentity(of: url, path: path))
         default:
             throw RunContextProbeError.unprovableWorktreeContent(
                 path: path, reason: "not a regular file or symlink"
             )
         }
+    }
+
+    /// Digest of everything below a submodule directory that a sandbox copy carries (`.git` is excluded
+    /// from sandboxes, so it is excluded here). Unreadable entries throw, as for any other path.
+    static func subtreeIdentity(of directory: URL, path: String) throws -> String {
+        let names: [String]
+        do {
+            names = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0 != ".git" }.sorted()
+        } catch {
+            throw RunContextProbeError.unprovableWorktreeContent(path: path, reason: "submodule directory could not be listed")
+        }
+        var entries: [String] = []
+        for name in names {
+            let childPath = path + "/" + name
+            entries.append("\(name)=" + (try contentIdentity(of: directory.appendingPathComponent(name), path: childPath)))
+        }
+        return ContentHash.of(entries.joined(separator: "\u{1F}"))
     }
 
     /// Directories the tool itself writes under the project root. The digest

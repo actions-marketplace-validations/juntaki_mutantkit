@@ -21,6 +21,12 @@ public struct ConsoleReporter: Reporter {
         var out: [String] = []
 
         out.append(header(report))
+        if let interruption = report.interruption {
+            out.append(palette.red(
+                "PARTIAL RESULT — interrupted by \(interruption.signal) after \(interruption.completedMutants) of "
+                    + "\(interruption.plannedMutants) mutants. Not a trustworthy measurement; resume the run to finish it."
+            ))
+        }
         out.append(baselineSection(report))
         out.append(integritySection(report))
         out.append(scoreSection(report))
@@ -179,13 +185,16 @@ public struct ConsoleReporter: Reporter {
     /// never hides a member's own change the way an earlier version's
     /// single-representative-per-row design did.
     private func survivorSection(_ report: RunReport) -> String {
-        let rows = SurvivorPresentationBuilder.build(from: report).rows
+        let presentation = SurvivorPresentationBuilder.build(from: report)
+        let rows = presentation.rows
 
         guard !rows.isEmpty else {
-            return [
-                palette.bold("Actionable test gaps (0)"),
-                "  none — every mutant that ran was killed"
-            ].joined(separator: "\n")
+            // "Every mutant that ran was killed" is vacuous when none ran (a red
+            // baseline, a baseline mismatch): say what happened instead.
+            let verdict = report.integrity.executed == 0
+                ? "  none — no mutants were executed"
+                : "  none — every mutant that ran was killed"
+            return [palette.bold("Actionable test gaps (0)"), verdict].joined(separator: "\n")
         }
 
         let notCovered = rows.filter { $0.reason == .mutationSiteNotCovered }
@@ -203,7 +212,8 @@ public struct ConsoleReporter: Reporter {
         }
         if !survived.isEmpty {
             lines.append("")
-            lines.append(palette.bold("Covered but survived — \(survived.aggregate.totalMutants) mutant(s)"))
+            lines.append(palette.bold(presentation.survivedHeading(mutants: survived.aggregate.totalMutants)))
+            if !presentation.coverageMeasured { lines.append("  \(SurvivorPresentation.coverageNotMeasuredNote)") }
             for row in survived { lines.append(contentsOf: renderRow(row)) }
         }
         return lines.joined(separator: "\n")

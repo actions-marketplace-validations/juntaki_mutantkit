@@ -19,6 +19,11 @@ public struct Configuration: Codable, Sendable, Hashable {
     /// see `QualityGateSettings`'s own comment for why it is excluded from
     /// `configurationHash`.
     public var qualityGate: QualityGateSettings
+    /// Opt-in evidence archive. `nil` (and omitted from the encoded
+    /// configuration) unless set, so an unset section leaves every identity
+    /// derived from the configuration unchanged; like `qualityGate` it never
+    /// affects what a run computes and is dropped from those identities.
+    public var evidence: EvidenceSettings?
 
     public init(
         version: Int = 1,
@@ -29,7 +34,8 @@ public struct Configuration: Codable, Sendable, Hashable {
         execution: ExecutionSettings = ExecutionSettings(),
         timeouts: TimeoutSettings = TimeoutSettings(),
         reports: [ReportKind] = [.console, .json],
-        qualityGate: QualityGateSettings = QualityGateSettings()
+        qualityGate: QualityGateSettings = QualityGateSettings(),
+        evidence: EvidenceSettings? = nil
     ) {
         self.version = version
         self.project = project
@@ -40,6 +46,7 @@ public struct Configuration: Codable, Sendable, Hashable {
         self.timeouts = timeouts
         self.reports = reports
         self.qualityGate = qualityGate
+        self.evidence = evidence
     }
 
     public init(from decoder: Decoder) throws {
@@ -53,6 +60,7 @@ public struct Configuration: Codable, Sendable, Hashable {
         timeouts = try container.decodeIfPresent(TimeoutSettings.self, forKey: .timeouts) ?? TimeoutSettings()
         reports = try container.decodeIfPresent([ReportKind].self, forKey: .reports) ?? [.console, .json]
         qualityGate = try container.decodeIfPresent(QualityGateSettings.self, forKey: .qualityGate) ?? QualityGateSettings()
+        evidence = try container.decodeIfPresent(EvidenceSettings.self, forKey: .evidence)
     }
 
     /// Hash of the canonical JSON encoding. Goes into the plan so that a plan
@@ -64,6 +72,7 @@ public struct Configuration: Codable, Sendable, Hashable {
     public var configurationHash: String {
         var hashed = self
         hashed.qualityGate = QualityGateSettings()
+        hashed.evidence = nil
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         guard let data = try? encoder.encode(hashed) else { return ContentHash.of("<unencodable>") }
@@ -117,6 +126,7 @@ public struct Configuration: Codable, Sendable, Hashable {
         hashed.timeouts = TimeoutSettings()
         hashed.reports = []
         hashed.qualityGate = QualityGateSettings()
+        hashed.evidence = nil
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         guard let data = try? encoder.encode(hashed) else { return ContentHash.of("<unencodable>") }
@@ -158,6 +168,7 @@ public struct Configuration: Codable, Sendable, Hashable {
         hashed.timeouts = TimeoutSettings()
         hashed.reports = []
         hashed.qualityGate = QualityGateSettings()
+        hashed.evidence = nil
         let planningExecution = (budget: execution.budget, diffBase: execution.diffBase)
         hashed.execution = ExecutionSettings()
         hashed.execution.budget = planningExecution.budget
@@ -410,9 +421,9 @@ public enum BudgetStratification: String, Codable, Sendable {
 }
 
 /// Opt-in switch between v1's `stratifyBy`-driven selection and Budget
-/// Selection v2's two-level allocator (ADR-0007). `nil`/`.v1` (the default)
+/// Selection v2's two-level allocator (the budget-selection v2 spec). `nil`/`.v1` (the default)
 /// keeps `stratifyBy`/`minimumPerOperator` in full effect, byte-identical to
-/// existing configs (ADR-0007 invariant 8, Choice 1 — v2 ships opt-in only
+/// existing configs (the budget-selection compatibility invariant — v2 ships opt-in only
 /// this milestone). `.v2` routes through `BudgetSelectorV2` instead, using
 /// `minimumPerStratum`/`weight` and ignoring `stratifyBy`/`minimumPerOperator`.
 public enum BudgetSelectionAlgorithm: String, Codable, Sendable {
@@ -433,16 +444,16 @@ public struct BudgetSettings: Codable, Sendable, Hashable {
     /// of that mode. Ignored under `.subtype` and `nil`. Ignored entirely
     /// under `selection: .v2` — see `minimumPerStratum`.
     public var minimumPerOperator: Int?
-    /// Opts into Budget Selection v2 (ADR-0007). See
+    /// Opts into Budget Selection v2 (the budget-selection v2 spec). See
     /// `BudgetSelectionAlgorithm`'s doc comment.
     public var selection: BudgetSelectionAlgorithm?
-    /// `selection: .v2` only: the outer stratum's (operator's) Phase 1
+    /// `selection: .v2` only: the outer stratum's (operator's)
     /// minimum-reservation floor — the v2 analogue of `minimumPerOperator`.
     /// Defaults to 1 when `.v2` is active and this is unset. Ignored under
     /// `.v1`/`nil`.
     public var minimumPerStratum: Int?
-    /// `selection: .v2` only: optional per-operator Phase 2 weight (ADR-0007
-    /// B.3), keyed by operator ID. Empty/unset means equal-share. If any
+    /// `selection: .v2` only: optional per-operator Phase 2 weight (the budget-selection budget semantics),
+    /// keyed by operator ID. Empty/unset means equal-share. If any
     /// entry is configured, every operator with an eligible candidate must
     /// be configured — a partial configuration is a config-load error (see
     /// `BudgetSelectorV2.validateWeightConfiguration`). Ignored under

@@ -9,7 +9,7 @@ import MutationModel
 /// precondition violations it must actively reject rather than silently
 /// mishandle:
 ///
-/// - A duplicate `MutationID` in the candidate pool. ADR-0007 A.14 found
+/// - A duplicate `MutationID` in the candidate pool. The duplicate-MutationID finding found
 ///   v1 silently drops one of two colliding points, uncounted, with no skip
 ///   record — breaking the codebase's own "skips are part of the plan"
 ///   promise. Invariant 4 (B.1) makes this a normative requirement on v2,
@@ -34,9 +34,9 @@ public enum BudgetSelectorV2Error: Error, CustomStringConvertible, Sendable, Equ
         case let .duplicateMutationID(id):
             """
             BudgetSelectorV2 received two candidates sharing MutationID '\(id.rawValue)'. \
-            The selector's input contract requires unique MutationIDs (ADR-0007 invariant 4); \
+            The selector's input contract requires unique MutationIDs; \
             an earlier version of this bug silently dropped one twin instead of rejecting the \
-            input outright (see A.14) — v2 refuses to repeat that.
+            input outright — v2 refuses to repeat that.
             """
         case let .invalidWeightConfiguration(issues):
             """
@@ -45,7 +45,7 @@ public enum BudgetSelectorV2Error: Error, CustomStringConvertible, Sendable, Equ
         case let .budgetMagnitudeExceeded(limit, totalCandidates, maximum):
             """
             budget.maxMutants (\(limit)) or total candidate count (\(totalCandidates)) exceeds \
-            \(maximum) (2^31), the bound ADR-0007 B.2's overflow-safety proof for Phase 2's \
+            \(maximum) (2^31), the bound the overflow-safety proof for Phase 2's \
             Int64 arithmetic is derived against. This is not a realistic corpus size; refusing \
             rather than risking an integer-overflow trap outside the proven-safe domain.
             """
@@ -76,7 +76,7 @@ public struct BudgetStratumV2: Sendable {
 }
 
 /// How many slots a stratum was granted, split by which of `allocateCounts`'s
-/// two phases granted them (ADR-0007 B.2 step 2). Never *which* mutants —
+/// two phases granted them (the budget-selection objective function step 2). Never *which* mutants —
 /// that is `allocate`'s job.
 public struct PhaseSplit: Sendable, Equatable {
     public let phase1: Int
@@ -98,7 +98,7 @@ public struct PhaseSplit: Sendable, Equatable {
 // v2-selected mutant and cannot depend on `MutationPlanner`. See
 // `MutationModel/InclusionReason.swift`.
 
-/// Budget Selection v2 (ADR-0007) — an opt-in, additive alternative to
+/// Budget Selection v2 (the budget-selection v2 spec) — an opt-in, additive alternative to
 /// `BudgetSelector` (v1). Generalizes v1's three modes into one two-level
 /// stratified allocator: an outer stratification dimension, and, only if
 /// configured, exactly one inner dimension scoped to each outer stratum's
@@ -113,7 +113,7 @@ public struct PhaseSplit: Sendable, Equatable {
 /// concluded it should ship neither as the default nor as an opt-in
 /// production feature on that evidence — it lost to v1 on both of the
 /// larger corpora measured — so shipping it as a documented configuration
-/// key was a contradiction, not a decision. See ADR-0007.
+/// key was a contradiction, not a decision. See the budget-selection v2 spec.
 ///
 /// The code is retained deliberately: the evaluation names a re-run that
 /// would settle it, and lifting the withdrawal is deleting one
@@ -163,7 +163,7 @@ public enum BudgetSelectorV2 {
 
     /// Decides *how many* slots each stratum gets, split by which phase
     /// granted them — never *which* mutants (that is `allocate`'s job).
-    /// Implements ADR-0007 B.2 step 2 exactly: a one-slot-per-stratum-per-
+    /// Implements the budget-selection objective function step 2 exactly: a one-slot-per-stratum-per-
     /// round minimum reservation (Phase 1), followed by an exact-integer
     /// capacitated largest-remainder distribution of whatever budget
     /// remains (Phase 2). No `Float`/`Double` anywhere in Phase 2, per the
@@ -375,7 +375,7 @@ public enum BudgetSelectorV2 {
             let newlySaturated = eligible.filter { state.residualCapacity($0) == 0 }
             eligible.subtract(newlySaturated)
 
-            // REVISED (ADR-0007 B.2, closing Codex re-review High #1): break
+            // REVISED (the budget-selection objective function): break
             // when no stratum became newly saturated this round — NOT when
             // no grant was "clipped" (`grant < floorShare`). A floor grant
             // that exactly exhausts a stratum's remaining capacity still
@@ -470,51 +470,71 @@ public enum BudgetSelectorV2 {
             guard n > 0 else { continue }
 
             if let innerDimension {
-                var byInner: [String: [MutationPoint]] = [:]
-                for point in stratum.candidates {
-                    byInner[innerDimension(point), default: []].append(point)
-                }
-                let innerStrata = byInner.keys.sorted().map { BudgetStratumV2(id: $0, candidates: byInner[$0] ?? []) }
-
-                // The one and only permitted recursive call. `limit` is `n`
-                // — the outer call's own already-bounded output for this
-                // stratum. It never itself receives an `innerDimension`
-                // argument, so a third level can never occur.
-                let innerCounts = try allocateCounts(
-                    strata: innerStrata, limit: n, seed: seed,
-                    minimumPerStratum: innerMinimumPerStratum, weight: innerWeight
+                selected += try selectWithinInnerStrata(
+                    stratum, count: n, seed: seed, innerDimension: innerDimension,
+                    innerMinimumPerStratum: innerMinimumPerStratum, innerWeight: innerWeight
                 )
-                for innerStratum in innerStrata.sorted(by: { $0.id < $1.id }) {
-                    guard let innerSplit = innerCounts[innerStratum.id] else { continue }
-                    let candidates = fill(innerStratum, count: innerSplit.total, seed: seed)
-                    for (ordinal, point) in candidates.enumerated() {
-                        // reasonCode is drawn from the TERMINAL (inner) call's
-                        // own PhaseSplit — never the outer stratum's (B.7).
-                        let reasonCode: InclusionReason.ReasonCode =
-                            ordinal < innerSplit.phase1 ? .minimumReservation : .proportionalRemainder
-                        selected.append((point, InclusionReason(
-                            mutationID: point.id,
-                            reasonCode: reasonCode,
-                            stratumPath: [stratum.id, innerStratum.id],
-                            selectionOrdinal: ordinal
-                        )))
-                    }
-                }
             } else {
-                let candidates = fill(stratum, count: n, seed: seed)
-                for (ordinal, point) in candidates.enumerated() {
-                    let reasonCode: InclusionReason.ReasonCode =
-                        ordinal < split.phase1 ? .minimumReservation : .proportionalRemainder
-                    selected.append((point, InclusionReason(
-                        mutationID: point.id,
-                        reasonCode: reasonCode,
-                        stratumPath: [stratum.id],
-                        selectionOrdinal: ordinal
-                    )))
-                }
+                selected += selectFromStratum(stratum, split: split, seed: seed)
             }
         }
         return selected
+    }
+
+    /// Two-level selection for one outer stratum: split its own already-bounded
+    /// `count` across the inner strata, then fill each. Output order is the
+    /// outer caller's: inner strata sorted by id, candidates in `fill` order.
+    private static func selectWithinInnerStrata(
+        _ stratum: BudgetStratumV2,
+        count n: Int,
+        seed: UInt64?,
+        innerDimension: (MutationPoint) -> String,
+        innerMinimumPerStratum: Int,
+        innerWeight: [String: Int]
+    ) throws -> [(point: MutationPoint, reason: InclusionReason)] {
+        var byInner: [String: [MutationPoint]] = [:]
+        for point in stratum.candidates {
+            byInner[innerDimension(point), default: []].append(point)
+        }
+        let innerStrata = byInner.keys.sorted().map { BudgetStratumV2(id: $0, candidates: byInner[$0] ?? []) }
+
+        // The one and only permitted recursive call. `limit` is `n`
+        // — the outer call's own already-bounded output for this
+        // stratum. It never itself receives an `innerDimension`
+        // argument, so a third level can never occur.
+        let innerCounts = try allocateCounts(
+            strata: innerStrata, limit: n, seed: seed,
+            minimumPerStratum: innerMinimumPerStratum, weight: innerWeight
+        )
+        var selected: [(point: MutationPoint, reason: InclusionReason)] = []
+        for innerStratum in innerStrata.sorted(by: { $0.id < $1.id }) {
+            guard let innerSplit = innerCounts[innerStratum.id] else { continue }
+            // reasonCode is drawn from the TERMINAL (inner) call's
+            // own PhaseSplit — never the outer stratum's.
+            selected += selectFromStratum(innerStratum, split: innerSplit, seed: seed, stratumPath: [stratum.id, innerStratum.id])
+        }
+        return selected
+    }
+
+    /// Fills one terminal stratum and tags each point with its reason: the
+    /// first `split.phase1` ordinals are minimum reservations, the rest proportional.
+    private static func selectFromStratum(
+        _ stratum: BudgetStratumV2,
+        split: PhaseSplit,
+        seed: UInt64?,
+        stratumPath: [String]? = nil
+    ) -> [(point: MutationPoint, reason: InclusionReason)] {
+        let candidates = fill(stratum, count: split.total, seed: seed)
+        return candidates.enumerated().map { ordinal, point in
+            let reasonCode: InclusionReason.ReasonCode =
+                ordinal < split.phase1 ? .minimumReservation : .proportionalRemainder
+            return (point, InclusionReason(
+                mutationID: point.id,
+                reasonCode: reasonCode,
+                stratumPath: stratumPath ?? [stratum.id],
+                selectionOrdinal: ordinal
+            ))
+        }
     }
 
     // MARK: - Deterministic ordering (B.2 step 4, B.4)

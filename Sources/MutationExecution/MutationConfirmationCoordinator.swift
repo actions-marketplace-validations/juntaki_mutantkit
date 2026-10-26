@@ -23,10 +23,9 @@ struct TimeoutInnerRetestRequest {
 /// test-running primitive (`runMutantTests`) every one of those retests, and
 /// `MutationRunner`'s own primary test run, executes through.
 ///
-/// Extracted out of `MutationRunner` (Phase A1 of the execution-pipeline
-/// decomposition): every method here closes over exactly the dependencies a
+/// Extracted out of `MutationRunner`: every method here closes over exactly the dependencies a
 /// retest needs to run in true isolation — `workspaces`/`build`/`test` to
-/// stand up an independent sandbox and drive it, `configuration` for the
+/// stand up an independent sandbox and drive it, `policy` for the
 /// `retestKilledMutants`/`confirmCrashKills` gates a retest itself checks
 /// (not the outer `confirmCrashKills`/`confirmTimedOutMutants` gate that
 /// decides *whether* to call in here at all — that stays in
@@ -35,17 +34,78 @@ struct TimeoutInnerRetestRequest {
 /// `MutationVerdictVerifier` (via `MutationEvidenceAssembler.finalize`)
 /// still does that, from whatever `ConfirmationObservation`s these methods
 /// hand back.
+///
+/// Extraction-plan Step 9: this type used to hold the whole `Configuration`
+/// for exactly these two flags. `policy` is the same
+/// `MutationVerdictVerifier.VerdictVerificationPolicy` `RunSession` carries
+/// (`session.policy`, itself the Step 1 factory's one canonical derivation
+/// from `Configuration.execution` — see `MutationVerdictVerifier.swift`),
+/// so this is a pure narrowing: the exact same two booleans, read from the
+/// exact same source, without holding the rest of `Configuration` this type
+/// never otherwise touched.
 struct MutationConfirmationCoordinator: Sendable {
     let workspaces: WorkspaceManager
     let build: any BuildAdapter
     let test: any TestAdapter
-    let configuration: Configuration
+    let policy: MutationVerdictVerifier.VerdictVerificationPolicy
     /// The tool's own stable, read-only original project copy —
     /// `MutationRunner`'s own `projectRoot`, threaded through unchanged.
     /// Used only by `confirmKill`, and only when `test` conforms to
     /// `PackageManifestConfirmationRetesting` — see that protocol's own doc
     /// comment for why a confirmation retest needs it at all.
     let projectRoot: URL
+    /// `test`'s `PackageManifestConfirmationRetesting` conformance,
+    /// resolved once here via the wrapper-aware
+    /// `packageManifestConfirmationRetesting(for:)` resolver — safe because
+    /// `test` is a `let`, set once by `MutationRunner.init` and never
+    /// reassigned for this coordinator's whole lifetime, so the resolved
+    /// value cannot go stale. The resolver itself (unwraps through
+    /// `TestAdapterWrapping`) is unchanged; only *when* it runs moves from
+    /// "every `confirmKill` call" to "once, at construction."
+    let manifestDependentTest: (any PackageManifestConfirmationRetesting)?
+    /// `test`'s `TestSelecting` conformance, memoized on the same terms as
+    /// `manifestDependentTest` above.
+    let selectingTest: (any TestSelecting)?
+    /// Persistent sandboxes the crash and timeout confirmations reuse; `nil`
+    /// outside an incremental-build run, where each gets a fresh one.
+    let confirmationPool: ConfirmationSandboxPool?
+
+    init(
+        workspaces: WorkspaceManager, build: any BuildAdapter, test: any TestAdapter,
+        policy: MutationVerdictVerifier.VerdictVerificationPolicy, projectRoot: URL,
+        reusesConfirmationSandboxes: Bool = false
+    ) {
+        self.workspaces = workspaces
+        self.build = build
+        self.test = test
+        self.policy = policy
+        self.projectRoot = projectRoot
+        manifestDependentTest = packageManifestConfirmationRetesting(for: test)
+        selectingTest = testAdapterCapability((any TestSelecting).self, for: test)
+        confirmationPool = reusesConfirmationSandboxes ? ConfirmationSandboxPool(workspaces: workspaces) : nil
+    }
+
+    /// The sandbox a crash or timeout confirmation rebuilds in: a pooled one
+    /// when the run is incremental, a fresh one named for `label` otherwise.
+    private func acquireConfirmationSandbox(_ point: MutationPoint, label: String) async throws -> Sandbox {
+        if let confirmationPool { return try await confirmationPool.acquire() }
+        return try await workspaces.createSandbox(id: "\(point.id.rawValue)-\(label)")
+    }
+
+    /// Ends a confirmation's use of `sandbox`: back to the pool with the
+    /// mutated file restored, or destroyed when there is no pool.
+    private func disposeConfirmationSandbox(_ sandbox: Sandbox, for point: MutationPoint) async {
+        if let confirmationPool {
+            await confirmationPool.release(sandbox, restoring: point.file)
+        } else {
+            try? await workspaces.destroySandbox(sandbox)
+        }
+    }
+
+    /// Destroys the pooled sandboxes once the run has no more confirmations to make.
+    func drainConfirmationPool() async {
+        await confirmationPool?.drain()
+    }
 
     /// Runs a mutant's tests, narrowed to `selectedTests` when the adapter
     /// can honour that (`TestSelecting`) and a set was supplied, and
@@ -65,7 +125,7 @@ struct MutationConfirmationCoordinator: Sendable {
         timeoutSeconds: Double,
         selectedTests: Set<TestIdentifier>?
     ) async throws -> TestRunResult {
-        if let selecting = test as? any TestSelecting {
+        if let selecting = selectingTest {
             return try await selecting.runMutant(
                 point, artifact: artifact, in: sandbox, timeoutSeconds: timeoutSeconds, selectedTests: selectedTests
             )
@@ -95,7 +155,7 @@ struct MutationConfirmationCoordinator: Sendable {
     func confirmKillIfNeeded(
         _ prepared: MutationRunner.PreparedMutant, baseline: MutationRunner.BaselineContext, run: TestRunResult, activationProven: Bool
     ) async -> (observation: ConfirmationObservation, durationSeconds: Double)? {
-        guard configuration.execution.retestKilledMutants, run.status == .failed, activationProven else { return nil }
+        guard policy.retestKilledMutants, run.status == .failed, activationProven else { return nil }
         let confirmationStarted = Date()
         let observation: ConfirmationObservation
         if let confirmationSandbox = prepared.confirmationSandbox {
@@ -164,7 +224,7 @@ struct MutationConfirmationCoordinator: Sendable {
             // more than that (`PackageManifestConfirmationRetesting`) gets
             // routed to its own dedicated method instead of the ordinary
             // `runMutant` path every other adapter still uses unchanged.
-            if let manifestDependent = packageManifestConfirmationRetesting(for: test) {
+            if let manifestDependent = manifestDependentTest {
                 confirmingRun = try await manifestDependent.runConfirmationRetest(
                     point, packageRoot: projectRoot, productsScratchRoot: sandbox,
                     timeoutSeconds: timeoutSeconds, selectedTests: selectedTests
@@ -177,7 +237,16 @@ struct MutationConfirmationCoordinator: Sendable {
         } catch {
             confirmingRun = infrastructureFailureRun("a confirmation run could not be started: \(error)")
         }
-        return ConfirmationObservation(kind: .kill, run: confirmingRun, originalFailingTests: originalFailingTests)
+        // Only a retest that reproduced the failure can still become a
+        // confirmed kill, so only then is the unmutated build run against the
+        // same tests (see `baselineControl`); a retest that did not fail
+        // already keeps the verdict out of the kill column.
+        let control = confirmingRun.status == .failed
+            ? await baselineControl(for: point, baseline: baseline, selectedTests: selectedTests)
+            : nil
+        return ConfirmationObservation(
+            kind: .kill, run: confirmingRun, originalFailingTests: originalFailingTests, baselineControl: control
+        )
     }
 
     /// Rebuilds a mutant from scratch in an independent sandbox and re-tests
@@ -211,9 +280,9 @@ struct MutationConfirmationCoordinator: Sendable {
             )
         }
 
-        let sandbox: URL
+        let sandbox: Sandbox
         do {
-            sandbox = try await workspaces.createSandbox(id: "\(point.id.rawValue)-crash-confirm")
+            sandbox = try await acquireConfirmationSandbox(point, label: "crash-confirm")
         } catch {
             return unconfirmed("No confirmation sandbox could be created: \(error)")
         }
@@ -222,7 +291,7 @@ struct MutationConfirmationCoordinator: Sendable {
         do {
             sourceURL = try workspaces.resolveSourceURL(in: sandbox, relativePath: point.file)
         } catch {
-            try? await workspaces.destroySandbox(at: sandbox)
+            await disposeConfirmationSandbox(sandbox, for: point)
             return unconfirmed("The confirmation sandbox's source could not be located: \(error)")
         }
 
@@ -230,22 +299,22 @@ struct MutationConfirmationCoordinator: Sendable {
         do {
             applied = try MutationApplication.applyInPlace(point, fileAt: sourceURL)
         } catch {
-            try? await workspaces.destroySandbox(at: sandbox)
+            await disposeConfirmationSandbox(sandbox, for: point)
             return unconfirmed("The mutation could not be re-applied for confirmation: \(error)")
         }
 
         let artifact: BuildArtifact
         do {
-            artifact = try await build.buildMutant(applied, in: sandbox)
+            artifact = try await build.buildMutant(applied, in: sandbox.workspaceRoot)
         } catch {
-            try? await workspaces.destroySandbox(at: sandbox)
+            await disposeConfirmationSandbox(sandbox, for: point)
             return unconfirmed("The confirmation rebuild did not build: \(error)")
         }
 
         let confirmingRun: TestRunResult
         do {
             confirmingRun = try await runMutantTests(
-                point, artifact: artifact, in: sandbox,
+                point, artifact: artifact, in: sandbox.workspaceRoot,
                 // Same per-mutant timeout the primary run this is confirming
                 // used — derived the same way, from the same
                 // `selectedTests`, never recomputed independently or widened
@@ -254,11 +323,11 @@ struct MutationConfirmationCoordinator: Sendable {
                 selectedTests: selectedTests
             )
         } catch {
-            try? await workspaces.destroySandbox(at: sandbox)
+            await disposeConfirmationSandbox(sandbox, for: point)
             return unconfirmed("The confirmation rebuild's tests could not be run: \(error)")
         }
 
-        try? await workspaces.destroySandbox(at: sandbox)
+        await disposeConfirmationSandbox(sandbox, for: point)
 
         let normalizedOriginal = originalDiagnosis.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedConfirming = confirmingRun.diagnosis.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -320,35 +389,14 @@ struct MutationConfirmationCoordinator: Sendable {
             )
         }
 
-        let sandbox: URL
-        do {
-            sandbox = try await workspaces.createSandbox(id: "\(point.id.rawValue)-timeout-confirm")
-        } catch {
-            return unconfirmed("No confirmation sandbox could be created: \(error)")
-        }
-
-        let sourceURL: URL
-        do {
-            sourceURL = try workspaces.resolveSourceURL(in: sandbox, relativePath: point.file)
-        } catch {
-            try? await workspaces.destroySandbox(at: sandbox)
-            return unconfirmed("The confirmation sandbox's source could not be located: \(error)")
-        }
-
-        let applied: AppliedMutation
-        do {
-            applied = try MutationApplication.applyInPlace(point, fileAt: sourceURL)
-        } catch {
-            try? await workspaces.destroySandbox(at: sandbox)
-            return unconfirmed("The mutation could not be re-applied for confirmation: \(error)")
-        }
-
+        let sandbox: Sandbox
         let artifact: BuildArtifact
-        do {
-            artifact = try await build.buildMutant(applied, in: sandbox)
-        } catch {
-            try? await workspaces.destroySandbox(at: sandbox)
-            return unconfirmed("The confirmation rebuild did not build: \(error)")
+        switch await rebuildForTimeoutConfirmation(point) {
+        case let .success(rebuilt):
+            sandbox = rebuilt.sandbox
+            artifact = rebuilt.artifact
+        case let .failure(failure):
+            return unconfirmed(failure.diagnosis)
         }
 
         // F3 zero-base review, verdict-contamination audit: cloned here —
@@ -361,7 +409,7 @@ struct MutationConfirmationCoordinator: Sendable {
         // still be writing. Same shape and same reasoning as `prepare`'s
         // own `confirmationSandbox` — see that method's doc comment.
         let innerConfirmationSandbox: URL?
-        if configuration.execution.retestKilledMutants, wasBatchAttributed {
+        if policy.retestKilledMutants, wasBatchAttributed {
             // Same `cloneProductsForConfirmationRetest` dispatch
             // `establishConfirmationSandbox` uses, for the identical
             // reason: this clone ultimately feeds `confirmKill` (via
@@ -379,7 +427,7 @@ struct MutationConfirmationCoordinator: Sendable {
         let confirmingRun: TestRunResult
         do {
             confirmingRun = try await runMutantTests(
-                point, artifact: artifact, in: sandbox,
+                point, artifact: artifact, in: sandbox.workspaceRoot,
                 // Same per-mutant timeout the primary run this is confirming
                 // used — derived the same way, from the same
                 // `selectedTests`, never recomputed independently or widened
@@ -388,8 +436,8 @@ struct MutationConfirmationCoordinator: Sendable {
                 selectedTests: selectedTests
             )
         } catch {
-            if let innerConfirmationSandbox { try? await workspaces.destroySandbox(at: innerConfirmationSandbox) }
-            try? await workspaces.destroySandbox(at: sandbox)
+            if let innerConfirmationSandbox { try? await workspaces.destroyProductsClone(at: innerConfirmationSandbox) }
+            await disposeConfirmationSandbox(sandbox, for: point)
             return unconfirmed("The confirmation rebuild's tests could not be run: \(error)")
         }
 
@@ -416,14 +464,14 @@ struct MutationConfirmationCoordinator: Sendable {
             observations.append(observation)
         }
 
-        if let innerConfirmationSandbox { try? await workspaces.destroySandbox(at: innerConfirmationSandbox) }
-        try? await workspaces.destroySandbox(at: sandbox)
+        if let innerConfirmationSandbox { try? await workspaces.destroyProductsClone(at: innerConfirmationSandbox) }
+        await disposeConfirmationSandbox(sandbox, for: point)
 
         // A crash, unlike an assertion kill, is never confirmed on the same
         // artifact (see `confirmCrashKill`'s doc comment) — its own fresh,
         // independent rebuild, same as any other first-observed crash.
         var crashConfirmationEvidence: CrashConfirmation?
-        if configuration.execution.confirmCrashKills, wasBatchAttributed,
+        if policy.confirmCrashKills, wasBatchAttributed,
            confirmingRun.status == .crashed, confirmingActivationProven {
             let (crashObservation, crashEvidence) = await confirmCrashKill(
                 point, baseline: baseline, selectedTests: selectedTests, originalDiagnosis: confirmingRun.diagnosis
@@ -462,7 +510,7 @@ struct MutationConfirmationCoordinator: Sendable {
     /// `confirmKillIfNeeded`'s outer-level counterpart handles a missing
     /// `confirmationSandbox`. Returns `nil` when no retest applies at all.
     func timeoutInnerConfirmKillIfNeeded(_ request: TimeoutInnerRetestRequest) async -> ConfirmationObservation? {
-        guard configuration.execution.retestKilledMutants, request.wasBatchAttributed,
+        guard policy.retestKilledMutants, request.wasBatchAttributed,
               request.confirmingRun.status == .failed, request.confirmingActivationProven else { return nil }
         guard let innerConfirmationSandbox = request.innerConfirmationSandbox else {
             return ConfirmationObservation(
@@ -484,5 +532,57 @@ struct MutationConfirmationCoordinator: Sendable {
             request.point, artifact: relocatedArtifact, in: innerConfirmationSandbox, baseline: request.baseline,
             selectedTests: request.selectedTests, originalFailingTests: request.confirmingRun.summary?.failingTests
         )
+    }
+}
+
+extension MutationConfirmationCoordinator {
+    /// A fresh sandbox holding this mutant's re-applied edit and its
+    /// confirming rebuild — what `confirmTimeout` tests in.
+    struct TimeoutConfirmationRebuild {
+        let sandbox: Sandbox
+        let artifact: BuildArtifact
+    }
+
+    /// Why a confirming rebuild could not be produced; the sandbox, if one
+    /// was created, is already destroyed.
+    struct TimeoutConfirmationRebuildFailure: Error {
+        let diagnosis: String
+    }
+
+    /// Creates the confirmation sandbox, re-applies `point`'s mutation to it,
+    /// and builds it.
+    private func rebuildForTimeoutConfirmation(
+        _ point: MutationPoint
+    ) async -> Result<TimeoutConfirmationRebuild, TimeoutConfirmationRebuildFailure> {
+        let sandbox: Sandbox
+        do {
+            sandbox = try await acquireConfirmationSandbox(point, label: "timeout-confirm")
+        } catch {
+            return .failure(.init(diagnosis: "No confirmation sandbox could be created: \(error)"))
+        }
+
+        let sourceURL: URL
+        do {
+            sourceURL = try workspaces.resolveSourceURL(in: sandbox, relativePath: point.file)
+        } catch {
+            await disposeConfirmationSandbox(sandbox, for: point)
+            return .failure(.init(diagnosis: "The confirmation sandbox's source could not be located: \(error)"))
+        }
+
+        let applied: AppliedMutation
+        do {
+            applied = try MutationApplication.applyInPlace(point, fileAt: sourceURL)
+        } catch {
+            await disposeConfirmationSandbox(sandbox, for: point)
+            return .failure(.init(diagnosis: "The mutation could not be re-applied for confirmation: \(error)"))
+        }
+
+        do {
+            let artifact = try await build.buildMutant(applied, in: sandbox.workspaceRoot)
+            return .success(TimeoutConfirmationRebuild(sandbox: sandbox, artifact: artifact))
+        } catch {
+            await disposeConfirmationSandbox(sandbox, for: point)
+            return .failure(.init(diagnosis: "The confirmation rebuild did not build: \(error)"))
+        }
     }
 }

@@ -145,7 +145,7 @@ struct CrossFileResultCacheInvalidationTests {
         let plan1 = narrowed(discoveredPlan1, to: point1)
 
         let digest1 = try await RunContextProbe.computeContextDigest(
-            projectRoot: repo, configuration: configuration, toolchain: toolchain, purpose: "resultCache2"
+            inputState: .forProject(repo), configuration: configuration, toolchain: toolchain, purpose: "resultCache2"
         )
 
         let cache = MutationResultCache(root: cacheRoot, policy: .permissive)
@@ -192,7 +192,7 @@ struct CrossFileResultCacheInvalidationTests {
         let point2 = try #require(discoveredPlan2.mutations.first { $0.file.hasSuffix("A.swift") })
         let plan2 = narrowed(discoveredPlan2, to: point2)
 
-        // Per-mutant identity (`PlannedMutationRef.pointDigest`, ADR-0005)
+        // Per-mutant identity (`PlannedMutationRef.pointDigest`, the authoritative verdict pipeline)
         // is scoped to the mutated file's own content alone — A.swift never
         // changed, so this must still be the identical mutation, not a new
         // one. If this test's premise ("A.swift's own mutation site is
@@ -205,7 +205,7 @@ struct CrossFileResultCacheInvalidationTests {
         )
 
         let digest2 = try await RunContextProbe.computeContextDigest(
-            projectRoot: repo, configuration: configuration, toolchain: toolchain, purpose: "resultCache2"
+            inputState: .forProject(repo), configuration: configuration, toolchain: toolchain, purpose: "resultCache2"
         )
         #expect(
             digest2 != digest1,

@@ -5,7 +5,7 @@ import SwiftCoreOperators
 import SwiftFrontend
 import Testing
 
-/// ADR-0008 Addendum 4: a typed `BuildFailure` from a shared schemata chunk
+/// Shared chunk build-failure attribution: a typed `BuildFailure` from a shared schemata chunk
 /// build is chunk-level evidence only — it must not directly establish
 /// `.unviable` for any individual `MutationID` the chunk represents.
 /// Instead every affected `MutationID` (whole-`MutationID`, all target
@@ -18,7 +18,7 @@ import Testing
 /// this same rule is pinned separately in
 /// `SchemataMutationRunnerRecoveryRebuildFailureTests`; this file covers the
 /// *initial* per-chunk build failure and the multi-target interaction.
-@Suite("SchemataMutationRunner: ADR-0008 Addendum 4 shared chunk build-failure attribution")
+@Suite("SchemataMutationRunner: shared chunk build-failure attribution")
 struct SchemataMutationRunnerSharedChunkBuildFailureTests {
     // MARK: - Fixture: a 3-entry single chunk, no scripts needed (the build fails before any entry ever spawns a process)
 
@@ -39,7 +39,9 @@ struct SchemataMutationRunnerSharedChunkBuildFailureTests {
         return sorted
     }
 
-    private func entry(mutationID: MutationID, target: String, chunkID: String, localIndex: UInt32, namespace: UInt64) -> SchemataPlanEntry {
+    private func entry(
+        mutationID: MutationID, target: String, chunkID: String, localIndex: UInt32, namespace: UInt64
+    ) -> SchemataPlanEntry {
         SchemataPlanEntry(
             mutationID: mutationID,
             placement: .embedded(placements: [
@@ -87,7 +89,7 @@ struct SchemataMutationRunnerSharedChunkBuildFailureTests {
 
     @Test("""
     A chunk whose initial build throws a typed BuildFailure routes every one of its entries to .sharedChunkBuildFailure fallback, \
-    and reports exactly one aggregate event with the affected count and diagnostic reference (ADR-0008 Addendum 4 observability)
+    and reports exactly one aggregate event with the affected count and diagnostic reference (shared chunk build-failure observability)
     """)
     func initialSharedTypedBuildFailureFallsBackEveryEntry() async throws {
         let points = try threePoints()
@@ -185,7 +187,10 @@ struct SchemataMutationRunnerSharedChunkBuildFailureTests {
     /// chunk build failing outright. The whole `MutationID` — including the
     /// already-produced, individually-valid verdict from the first target —
     /// must fall back, never a partial schemata/isolated split.
-    @Test("Multi-target: one target's shared build failure discards the whole MutationID, including the other target's already-verified result")
+    @Test("""
+    Multi-target: one target's shared build failure discards the whole MutationID, \
+    including the other target's already-verified result
+    """)
     func multiTargetSharedBuildFailureDiscardsAlreadyVerifiedPlacement() async throws {
         let points = try threePoints()
         let point = points[0]
@@ -260,7 +265,10 @@ struct SchemataMutationRunnerSharedChunkBuildFailureTests {
         #expect(Set(outcome.isolatedFallbacks.map(\.mutationID)) == Set([pointA.id, pointB.id]))
     }
 
-    @Test("A chunk whose build fails with an untyped error or a nil product hash reports no observability event — only a typed BuildFailure does")
+    @Test("""
+    A chunk whose build fails with an untyped error or a nil product hash reports no observability event \
+    — only a typed BuildFailure does
+    """)
     func nonTypedBuildFailuresReportNoEvent() async throws {
         let points = try threePoints()
         let pointsByID = Dictionary(uniqueKeysWithValues: points.map { ($0.id, $0) })
@@ -313,7 +321,9 @@ private struct NeverCalledPastBaselineTestAdapter: TestAdapter {
         )
     }
 
-    func runMutant(_ point: MutationPoint, artifact: BuildArtifact, in workspace: URL, timeoutSeconds: Double) async throws -> TestRunResult {
+    func runMutant(
+        _ point: MutationPoint, artifact: BuildArtifact, in workspace: URL, timeoutSeconds: Double
+    ) async throws -> TestRunResult {
         fatalError("unreachable: buildMutant always throws before any test runs")
     }
 }

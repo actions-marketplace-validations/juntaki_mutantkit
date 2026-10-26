@@ -26,10 +26,21 @@ import MutationModel
 public struct PrioritizingTestAdapter: TestSelecting, TestAdapterWrapping, Sendable {
     private let base: any TestAdapter
     private let priorityStore: TestPriorityStore
+    /// `base`'s `TestSelecting` conformance, resolved once here rather than
+    /// re-cast on every `measurePerTestCoverage`/`runMutant(...selectedTests:)`
+    /// call — safe because `base` is a `let`, fixed for this wrapper's whole
+    /// lifetime, so the cast's result cannot change between calls. Resolved
+    /// through the same wrapper-aware `testAdapterCapability` helper every
+    /// other memoized capability in this codebase uses (never a bare `as?`),
+    /// even though `base` cannot itself be `TestAdapterWrapping`-wrapped
+    /// further today — this stays correct if a second wrapper type is ever
+    /// introduced.
+    private let selectingBase: (any TestSelecting)?
 
     public init(base: any TestAdapter, priorityStore: TestPriorityStore) {
         self.base = base
         self.priorityStore = priorityStore
+        selectingBase = testAdapterCapability((any TestSelecting).self, for: base)
     }
 
     /// `TestAdapterWrapping.wrappedTestAdapter` — exposes `base` so a caller
@@ -78,7 +89,7 @@ public struct PrioritizingTestAdapter: TestSelecting, TestAdapterWrapping, Senda
         in workspace: URL,
         timeoutSeconds: Double
     ) async -> PerTestCoverageMap? {
-        guard let selecting = base as? any TestSelecting else { return nil }
+        guard let selecting = selectingBase else { return nil }
         return await selecting.measurePerTestCoverage(
             artifact: artifact,
             in: workspace,
@@ -93,7 +104,7 @@ public struct PrioritizingTestAdapter: TestSelecting, TestAdapterWrapping, Senda
         timeoutSeconds: Double,
         selectedTests: Set<TestIdentifier>?
     ) async throws -> TestRunResult {
-        guard let selecting = base as? any TestSelecting,
+        guard let selecting = selectingBase,
               let selectedTests,
               !selectedTests.isEmpty
         else {
@@ -107,11 +118,7 @@ public struct PrioritizingTestAdapter: TestSelecting, TestAdapterWrapping, Senda
 
         let ordered = await priorityStore.order(selectedTests)
         let startedAt = Date()
-        var total = 0
-        var passed = 0
-        var failed = 0
-        var failingTests: [String] = []
-        var accumulatedDuration: Double = 0
+        var accumulated = AccumulatedSummary()
         var lastResult: TestRunResult?
 
         for test in ordered {
@@ -145,13 +152,7 @@ public struct PrioritizingTestAdapter: TestSelecting, TestAdapterWrapping, Senda
             )
             lastResult = result
 
-            if let summary = result.summary {
-                total += summary.total
-                passed += summary.passed
-                failed += summary.failed
-                failingTests.append(contentsOf: summary.failingTests)
-                accumulatedDuration += summary.durationSeconds ?? 0
-            }
+            if let summary = result.summary { accumulated.add(summary) }
 
             // First detection wins. Mutation testing only needs one trustworthy
             // witness that the mutant was caught; running the rest of the
@@ -176,23 +177,40 @@ public struct PrioritizingTestAdapter: TestSelecting, TestAdapterWrapping, Senda
             )
         }
 
-        let summary: TestOutcomeSummary? = total > 0
-            ? TestOutcomeSummary(
-                total: total,
-                passed: passed,
-                failed: failed,
-                failingTests: failingTests,
-                durationSeconds: accumulatedDuration
-            )
-            : nil
-
         return TestRunResult(
             status: .passed,
-            summary: summary,
+            summary: accumulated.summary,
             command: lastResult.command,
             resultArtifactPath: lastResult.resultArtifactPath,
             diagnosis: "All \(ordered.count) covering test(s) passed; selected tests were executed in historical kill-priority order with early abort enabled."
         )
+    }
+}
+
+/// The running total of every selected test's own summary, folded into the
+/// one summary a passing multi-test run reports.
+private struct AccumulatedSummary {
+    private var total = 0
+    private var passed = 0
+    private var failed = 0
+    private var failingTests: [String] = []
+    private var duration: Double = 0
+
+    mutating func add(_ summary: TestOutcomeSummary) {
+        total += summary.total
+        passed += summary.passed
+        failed += summary.failed
+        failingTests.append(contentsOf: summary.failingTests)
+        duration += summary.durationSeconds ?? 0
+    }
+
+    /// `nil` while no test has reported anything.
+    var summary: TestOutcomeSummary? {
+        total > 0
+            ? TestOutcomeSummary(
+                total: total, passed: passed, failed: failed, failingTests: failingTests, durationSeconds: duration
+            )
+            : nil
     }
 }
 

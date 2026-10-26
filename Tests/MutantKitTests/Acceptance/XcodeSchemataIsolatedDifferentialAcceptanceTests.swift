@@ -7,7 +7,7 @@ import SwiftCoreOperators
 import SwiftFrontend
 import Testing
 
-/// The Xcode half of ADR-0006 Stage 3's gate — the same comparison
+/// The Xcode half of the re-enabled schemata scoring's gate — the same comparison
 /// `SchemataIsolatedDifferentialAcceptanceTests` proves for SwiftPM, against
 /// a real `xcodegen`-generated macOS framework + unit-test bundle instead of
 /// a Swift package: the exact same `MutationPoint`s run to completion under
@@ -124,7 +124,9 @@ struct XcodeSchemataIsolatedDifferentialAcceptanceTests {
     }
 
     private func makeAdapter(projectRoot: URL, projectFile: URL) -> XcodeBuildAdapter {
-        XcodeBuildAdapter(configuration: Configuration(), kind: .xcodeProject, projectFile: projectFile, projectRoot: projectRoot)
+        XcodeBuildAdapter(
+            configuration: Acceptance.macOSConfiguration(), kind: .xcodeProject, projectFile: projectFile, projectRoot: projectRoot
+        )
     }
 
     private func runIsolated(directory: URL, projectFile: URL, points: [MutationPoint], scratchRoot: URL) async throws -> [MutationResult] {
@@ -141,7 +143,8 @@ struct XcodeSchemataIsolatedDifferentialAcceptanceTests {
         let adapter = makeAdapter(projectRoot: directory, projectFile: projectFile)
         let workspaces = try WorkspaceManager(projectRoot: directory, scratchRoot: scratchRoot)
         let runner = MutationRunner(
-            plan: plan, configuration: Configuration(), projectRoot: directory, build: adapter, test: adapter, workspaces: workspaces
+            plan: plan, configuration: Acceptance.macOSConfiguration(), projectRoot: directory,
+            build: adapter, test: adapter, workspaces: workspaces
         )
         let report = try await runner.run()
         #expect(report.results.count == 2)

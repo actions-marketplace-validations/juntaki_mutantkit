@@ -37,6 +37,9 @@ struct DoctorCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Emit the diagnosis as JSON instead of the text report below.")
     var json = false
 
+    @Flag(name: .long, help: "Treat a missing or unusable schemata runtime as a failure instead of a warning (for qualification runs).")
+    var requireSchemataRuntime = false
+
     func run() async throws {
         let root = common.resolvedProjectRoot
         let outcome = await ReadinessCheck.run(root: root, configPath: common.configPath, skipBuild: skipBuild)
@@ -64,7 +67,10 @@ struct DoctorCommand: AsyncParsableCommand {
         // both existed at once — see `DiagnosisNameUniquenessTests`).
         let diagnosis = BuildDiagnosis(
             items: ReadinessCheck.deduplicated(
-                outcome.diagnosis.items + [await Self.sharedModuleCacheDiagnosis(root: root, configuration: outcome.configuration)]
+                outcome.diagnosis.items + [
+                    await Self.sharedModuleCacheDiagnosis(root: root, configuration: outcome.configuration),
+                    SchemataRuntimeDiagnosis.item(required: requireSchemataRuntime)
+                ]
             )
         )
 
@@ -145,7 +151,7 @@ struct DoctorCommand: AsyncParsableCommand {
             detail: """
             execution.sharedModuleCache: \(configuration.execution.sharedModuleCache ? "on" : "off (default)") \
             (isolated SwiftPM/macOS builds only today — no effect on an Xcode project/workspace or a non-macOS \
-            Swift package). APFS clonefile: \(cloneSupported ? "supported" : "not supported — falls back to a plain copy"). \
+            Swift package; on Xcode 27 it is not expected to speed anything up). APFS clonefile: \(cloneSupported ? "supported" : "not supported — falls back to a plain copy"). \
             Toolchain fingerprint \(fingerprint.digest) (\(fingerprint.canonicalDescription)). \
             Resolved cache path for `mutantkit run`: \(cachePath.path).
             """

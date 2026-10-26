@@ -17,13 +17,88 @@ everywhere rather than improvised per command:
 | `2` | `integrityFailure` | The run happened but its own invariants did not reconcile, so no score was produced. Kept distinct from `operationalError` because the difference matters to whoever reads the CI log — this is "the evidence doesn't add up," not "the tool crashed." |
 | `3` | `survivorsFound` | Mutants survived and the caller asked for that to fail the build (e.g. `run --fail-on-survivors`). |
 | `4` | `qualityGateFailure` | A trusted report missed an explicit CI mutation-quality threshold (`mutantkit gate`). |
+| `5` | `notFullyVerified` | `mutantkit trust` found no mismatch but could not verify every required check (typically because the plan the report names was not found, or because the report's results were verified by an older verifier version than the current one), so it does not call the report trustworthy. Distinct from `2`, which means a check failed. |
+| `6` | `qualificationFailed` | `run --require-schemata` asked for a valid schemata measurement and the run did not deliver one: schemata was not requested, the whole run degraded, no mutation executed through schemata, or more mutations fell back to isolated execution than `--max-unexpected-fallbacks` (default `0`) allows. `buildReceiptUnavailable` and `sharedChunkBuildFailure` fallbacks always fail it. Meant for qualification, benchmarks and acceptance tests; ordinary runs should keep tolerating fallback. |
+| `7` | `interrupted` | `run` was stopped by `SIGINT`, `SIGTERM` or `SIGHUP`. Finished mutants are in the checkpoint, a report marked partial was written when any mutant had a result, and the exact resume command was printed. Never `0`: the plan was not fully measured. |
 
 `MutantKitExit.onFailure` is the one place that maps an uncaught Swift error
 to `operationalError` explicitly, so a plain file-I/O or JSON-decode failure
 that reaches the top of a command doesn't fall through to
 `ArgumentParser`'s own default failure exit code by accident. An error that
-already carries a deliberate `ExitCode` (any of the four non-zero codes
+already carries a deliberate `ExitCode` (any of the non-zero codes
 above) passes through unchanged.
+
+## Interrupting `run`
+
+With the default `isolated` execution strategy, `SIGINT` (Ctrl-C), `SIGTERM` and
+`SIGHUP` stop `mutantkit run` gracefully instead of killing it:
+
+1. **First signal**: no new mutant is started. Mutants already running finish
+   (bounded by the mutant timeout) and are checkpointed as usual.
+2. **Second signal**: in-flight work is cancelled; the child process trees are
+   terminated through the same path a timeout uses. A mutant cut short this way
+   is not checkpointed or reported, so it simply runs again on resume.
+3. **Third signal**: the process exits immediately. Nothing is lost: every
+   finished mutant was already flushed to the checkpoint.
+
+Afterwards `run` writes its usual reports for the mutants that finished, prints
+the checkpoint path and the exact command to resume (the command you typed,
+without `--no-resume`), and exits with `7`. The report is **partial**:
+`report.json` carries an `interruption` object (`signal`, `completedMutants`,
+`plannedMutants`), the console and CI-summary reports say "PARTIAL RESULT", and
+the report has no score and fails integrity (every unfinished mutant is listed
+as a planned mutation without a result), so `gate`, `trust` and `verify-run`
+refuse it. A partial run is not recorded to `.mutantkit/history`. A signal that
+arrives after the last mutant finished changes nothing: that report is complete.
+
+A signal during the baseline waits for the baseline to finish unless repeated;
+the run then stops before starting any mutant. Runs that cannot fingerprint
+their inputs (for example outside a git repository) never resume from a
+checkpoint, and say so instead of printing a resume command. Other execution
+strategies (`schemata`) keep the default signal behaviour for now.
+
+## Re-verifying a finished report: `verify-run` and `trust`
+
+Both commands re-run the verifier's checks over a report instead of believing
+what it says about itself. They check internal consistency and
+re-derivability, not authenticity: the report is still assumed to be the one
+the run produced.
+
+```bash
+mutantkit verify-run report.json [--plan plan.json] [--evidence <dir>] [--json]
+mutantkit trust --report report.json [--plan plan.json] [--evidence <dir>] [--json]
+```
+
+- **Tier A** (always): plan identity, source anchors and recorded source evidence, per-result provenance,
+  and a recomputation of the integrity block and the score from the results.
+  `--plan` supplies the plan the report was produced from; `trust` also looks
+  for it next to the report and in the project root, `verify-run` does not.
+  Checks that need the plan are "not verifiable" without it.
+- **Tier B** (only with an evidence archive, see `evidence.archive` in
+  [configuration](configuration.md)): results are re-judged from the raw
+  observations the run archived. `--evidence <dir>` selects an archive; by
+  default the one the report records is used. Without an archive the checks
+  that need raw observations stay "not verifiable".
+- A check that cannot be verified is never counted as passed.
+
+| Command | Result | Exit |
+| --- | --- | --- |
+| `verify-run` | no check failed, every check passed ("Fully verified") | `0` |
+| `verify-run` | no check failed, but some could not be verified (`PARTIAL`; `complete: false` in `--json`) | `0` |
+| `verify-run` | a check failed ("MISMATCH") | `2` |
+| `verify-run` | report, plan or `--evidence` directory unreadable | `1` |
+| `trust` | every required check verified and passed (`trustworthy`) | `0` |
+| `trust` | a check failed, or the stored integrity did not pass (`mismatch`) | `2` |
+| `trust` | nothing failed but a required check could not be verified (`notFullyVerified`) | `5` |
+
+`verify-run` exits `0` for a partial verification, so a script that needs a
+full one must read `complete` from `--json` (or the text line `Fully verified`)
+rather than the exit code alone. `trust` is the fail-closed one: a report is
+`trustworthy` only when every required check was re-verified. A report whose
+results were judged by an older MutantKit verifier version than the current
+one can never be `trustworthy`: it exits `5` with "produced by an older
+verifier", and a fresh run is the way out. The `--json` shapes are in
+[json-output-contracts](json-output-contracts.md).
 
 ## stdout vs. stderr
 
@@ -35,23 +110,10 @@ reason `JSONOutput.emitError` exists: a command that cannot proceed still
 emits exactly one JSON document (a `JSONErrorEnvelope`), not an uncaught
 error that prints to stdout or stderr as unstructured text.
 
-This is now audited exhaustively, not just mostly-enforced: every bare
-`print(...)`-then-`throw ExitCode` diagnostic in `Sources/CLI` (the `mutantkit`
-CLI itself — this does not extend to the separate `BenchmarkRunner` developer
-tool, which is not part of this contract) routes to `FileHandle
-.standardError` as of the v0.5 Stable Contracts pass. That covers
-`OperatorCatalogCommand`, `NextCommand`, `FixPlanCommand`,
-`OverrideOptions.apply` in `MutantKit.swift` (shared by five commands'
-`--profile`/`--execution-profile` validation), `ConfigurationPreflight`,
-`DoctorCommand`, `ExecutionProfileCommand`, `InspectCommand`, `DryRunCommand`,
-`InitCommand`, `RunCommand` (including a same-shape instance the original
-audit's grep missed, alongside the three it found), `PlanCommand`,
-`ReproduceCommand`, `MigrateCommand`, `RunCommand+Reports`, `SetupCommand`,
-and `RunCommand+DependencyResolutionPreflight`. A follow-up sweep re-grepped
-every `print(...)` within three lines of a `throw ExitCode` across all of
-`Sources/CLI` and found none left unconverted. Treat "diagnostics to stderr"
-as a checked, call-site-verified invariant for this command's own diagnostics,
-not just an intended one.
+Every diagnostic in `Sources/CLI` that is printed before a `throw ExitCode`
+goes to stderr; separate developer tools are not part of this contract. Treat
+"diagnostics to stderr" as a checked, call-site-verified invariant for this
+command's own diagnostics, not just an intended one.
 
 ## `--json` vs. `--format agent`
 

@@ -51,6 +51,12 @@ public struct ExecutionSettings: Codable, Sendable, Hashable {
     /// is. It only re-runs tests, never the build: the artifact is already known
     /// good, and rebuilding would not change whether the suite agrees with
     /// itself.
+    ///
+    /// The retest runs the same built artifact, so a failure the environment or
+    /// the test order causes reproduces identically. A kill whose retest fails
+    /// again is therefore also checked against the unmutated build (a baseline
+    /// control): the same tests must pass there, or the kill is not counted. One
+    /// control run is shared by every kill with the same test selection.
     public var retestKilledMutants: Bool
     /// Re-confirms a `killedByCrash` verdict with a full, independent
     /// rebuild in a fresh sandbox before trusting it, and reclassifies it as
@@ -373,7 +379,7 @@ public struct ExecutionSettings: Codable, Sendable, Hashable {
     /// the *first* process's build is still actively using. The reset-at-
     /// first-resolution race described above is a different code path
     /// (`WorkspaceManager.init`'s own wipe, and `SharedModuleCacheNamespace
-    /// .moduleCachePath(forSandbox:workingDirectory:)`'s once-per-scratch-
+    /// .moduleCachePath(scratchRoot:workingDirectory:)`'s once-per-scratch-
     /// root reset) and is not covered by that claim -- both still run
     /// unconditionally on first use, regardless of whether the claim was
     /// won -- so the limitation above still holds for that path, and the
@@ -477,6 +483,17 @@ public struct ExecutionSettings: Codable, Sendable, Hashable {
     /// like every other eligibility check in
     /// `ExecutionProfileResolver.decisions(for:current:)`.
     public var profileCoverageSkip: Bool
+    /// How finely `selectCoveringTests` attributes baseline coverage to tests
+    /// (`test`, the default, or `suite`).
+    ///
+    /// `suite` makes the one-time attribution pass run each test suite once
+    /// instead of every test once, and credits the suite's coverage to all its
+    /// tests. A line then maps to every test of every suite that reaches it, a
+    /// superset of what `test` finds, so selection stays sound and a mutant
+    /// may run somewhat more tests. It pays off when there are many tests and
+    /// each costs a process start. Only the SwiftPM macOS adapter reads it;
+    /// other adapters attribute per test regardless.
+    public var coverageGranularity: CoverageGranularity
 
     public init(
         profile: ExecutionProfile = .reference,
@@ -496,7 +513,8 @@ public struct ExecutionSettings: Codable, Sendable, Hashable {
         simulatorPool: Bool = false,
         sharedModuleCache: Bool = false,
         cleanSubtreeCloning: Bool = false,
-        profileCoverageSkip: Bool = false
+        profileCoverageSkip: Bool = false,
+        coverageGranularity: CoverageGranularity = .test
     ) {
         self.profile = profile
         self.strategy = strategy
@@ -516,6 +534,7 @@ public struct ExecutionSettings: Codable, Sendable, Hashable {
         self.sharedModuleCache = sharedModuleCache
         self.cleanSubtreeCloning = cleanSubtreeCloning
         self.profileCoverageSkip = profileCoverageSkip
+        self.coverageGranularity = coverageGranularity
     }
 
     public init(from decoder: Decoder) throws {
@@ -543,6 +562,44 @@ public struct ExecutionSettings: Codable, Sendable, Hashable {
         sharedModuleCache = try container.decodeIfPresent(Bool.self, forKey: .sharedModuleCache) ?? false
         cleanSubtreeCloning = try container.decodeIfPresent(Bool.self, forKey: .cleanSubtreeCloning) ?? false
         profileCoverageSkip = try container.decodeIfPresent(Bool.self, forKey: .profileCoverageSkip) ?? false
+        coverageGranularity = try container.decodeIfPresent(CoverageGranularity.self, forKey: .coverageGranularity) ?? .test
+    }
+
+    /// Every key is encoded as the synthesized conformance would, except
+    /// `coverageGranularity`, which is written only when it is not the default.
+    /// `Configuration.configurationHash` hashes this encoding, so a new key written
+    /// unconditionally would change the hash of every existing configuration and
+    /// make every plan made before it look stale.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(profile, forKey: .profile)
+        try container.encode(strategy, forKey: .strategy)
+        try container.encodeIfPresent(workers, forKey: .workers)
+        try container.encode(budget, forKey: .budget)
+        try container.encodeIfPresent(diffBase, forKey: .diffBase)
+        try container.encode(measureCoverage, forKey: .measureCoverage)
+        try container.encode(retestKilledMutants, forKey: .retestKilledMutants)
+        try container.encode(confirmCrashKills, forKey: .confirmCrashKills)
+        try container.encode(confirmTimedOutMutants, forKey: .confirmTimedOutMutants)
+        try container.encode(selectCoveringTests, forKey: .selectCoveringTests)
+        try container.encode(incrementalBuild, forKey: .incrementalBuild)
+        try container.encode(earlyAbortSelectedTests, forKey: .earlyAbortSelectedTests)
+        try container.encodeIfPresent(testBatchSize, forKey: .testBatchSize)
+        try container.encode(noOpCanarySampleRate, forKey: .noOpCanarySampleRate)
+        try container.encode(simulatorPool, forKey: .simulatorPool)
+        try container.encode(sharedModuleCache, forKey: .sharedModuleCache)
+        try container.encode(cleanSubtreeCloning, forKey: .cleanSubtreeCloning)
+        try container.encode(profileCoverageSkip, forKey: .profileCoverageSkip)
+        if coverageGranularity != .test {
+            try container.encode(coverageGranularity, forKey: .coverageGranularity)
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case profile, strategy, workers, budget, diffBase, measureCoverage, retestKilledMutants
+        case confirmCrashKills, confirmTimedOutMutants, selectCoveringTests, incrementalBuild
+        case earlyAbortSelectedTests, testBatchSize, noOpCanarySampleRate, simulatorPool
+        case sharedModuleCache, cleanSubtreeCloning, profileCoverageSkip, coverageGranularity
     }
 
     public func resolvedWorkerCount() -> Int {

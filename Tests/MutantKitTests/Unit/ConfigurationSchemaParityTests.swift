@@ -30,7 +30,8 @@ struct ConfigurationSchemaParityTests {
             operators: OperatorSettings(),
             execution: ExecutionSettings(),
             timeouts: TimeoutSettings(),
-            reports: [.console]
+            reports: [.console],
+            evidence: EvidenceSettings()
         )
         #expect(try encodedKeys(configuration) == topLevelKeys(in: try schema))
     }
@@ -62,7 +63,8 @@ struct ConfigurationSchemaParityTests {
             ),
             diffBase: "origin/main", measureCoverage: true, retestKilledMutants: true,
             confirmCrashKills: true, confirmTimedOutMutants: true, selectCoveringTests: true,
-            incrementalBuild: true, earlyAbortSelectedTests: true, testBatchSize: 8
+            incrementalBuild: true, earlyAbortSelectedTests: true, testBatchSize: 8,
+            coverageGranularity: .suite
         )
         #expect(try encodedKeys(execution) == section("execution", in: schema))
 
@@ -218,6 +220,23 @@ struct ConfigurationSchemaParityTests {
             integrityViolations: .init(maximum: 0)
         )
         #expect(try encodedKeys(settings) == section("qualityGate", in: schema))
+    }
+
+    @Test("evidence matches EvidenceSettings")
+    func evidenceSection() throws {
+        #expect(try encodedKeys(EvidenceSettings(archive: true, keep: 3)) == section("evidence", in: schema))
+    }
+
+    @Test("An unset evidence section is omitted, leaving every configuration identity unchanged")
+    func unsetEvidenceIsOmitted() throws {
+        let plain = Configuration()
+        #expect(try encodedKeys(plain).contains("evidence") == false)
+        var withArchive = plain
+        withArchive.evidence = EvidenceSettings(archive: true)
+        #expect(plain.configurationHash == withArchive.configurationHash)
+        #expect(plain.evidence == nil)
+        #expect(try JSONDecoder().decode(Configuration.self, from: Data("{}".utf8)).evidence == nil)
+        #expect(try JSONDecoder().decode(Configuration.self, from: Data(#"{"evidence":{}}"#.utf8)).evidence?.archive == false)
     }
 
     // MARK: - Helpers

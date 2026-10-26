@@ -25,15 +25,32 @@ public enum SharedBaselineEstablisher {
         case failed(record: BaselineRecord, diagnosis: String)
     }
 
+    /// The per-test coverage cache the baseline pass may load from or store
+    /// into, and the key that decides whether a prior measurement matches —
+    /// bundled so `establish` stays within swiftlint's parameter-count limit.
+    /// Both are optional independently, exactly as the runners' own
+    /// `coverageCache`/`coverageCacheKey` pair is.
+    public struct CoverageCacheSelection: Sendable {
+        public let cache: CoverageProfileCache?
+        public let key: CoverageProfileCache.Key?
+
+        public static let none = CoverageCacheSelection(cache: nil, key: nil)
+
+        public init(cache: CoverageProfileCache?, key: CoverageProfileCache.Key?) {
+            self.cache = cache
+            self.key = key
+        }
+    }
+
     public static func establish(
         build: any BuildAdapter,
         test: any TestAdapter,
         in sandbox: URL,
         configuration: Configuration,
         projectRoot: URL,
-        coverageCache: CoverageProfileCache?,
-        coverageCacheKey: CoverageProfileCache.Key?,
-        operationalIssues: OperationalIssueLog? = nil
+        coverageCache: CoverageCacheSelection = .none,
+        operationalIssues: OperationalIssueLog? = nil,
+        workspaces: WorkspaceManager? = nil
     ) async -> Outcome {
         let started = Date()
         let timeouts = TimeoutController(settings: configuration.timeouts)
@@ -53,11 +70,15 @@ public enum SharedBaselineEstablisher {
             )
         }
 
+        // Kept before the baseline test run for kill baseline controls.
+        let control = await BaselineControlSource.establish(configuration.execution, from: artifact, workspaces: workspaces, test: test)
+
         let testStarted = Date()
         let run: TestRunResult
         do {
             run = try await test.runBaseline(artifact, in: sandbox, timeoutSeconds: timeouts.baselineLimitSeconds)
         } catch {
+            await control?.teardown()
             return .failed(
                 record: unusableBaseline(startedAt: started, buildCommand: artifact.command),
                 diagnosis: "The baseline test run could not be completed: \(error)"
@@ -81,6 +102,7 @@ public enum SharedBaselineEstablisher {
         )
 
         guard run.status == .passed else {
+            await control?.teardown()
             return .failed(record: record, diagnosis: suiteDidNotPassDiagnosis(run))
         }
 
@@ -89,7 +111,7 @@ public enum SharedBaselineEstablisher {
         // `BaselineCoverageMeasurement`'s own doc comment for why this
         // particular step must not have two copies.
         let measured = await BaselineCoverageMeasurement(
-            configuration: configuration, cache: coverageCache, cacheKey: coverageCacheKey,
+            configuration: configuration, cache: coverageCache.cache, cacheKey: coverageCache.key,
             operationalIssues: operationalIssues
         ).measure(
             with: test, against: artifact, in: sandbox, projectRoot: projectRoot,
@@ -105,15 +127,18 @@ public enum SharedBaselineEstablisher {
             testCommand: record.testCommand,
             buildDurationSeconds: record.buildDurationSeconds,
             testDurationSeconds: record.testDurationSeconds,
-            profilingDurationSeconds: measured.profilingDurationSeconds
+            profilingDurationSeconds: measured.profilingDurationSeconds,
+            coverageReused: measured.reusedFromCache ? true : nil
         )
 
-        return .established(EstablishedBaseline(
+        var established = EstablishedBaseline(
             record: recordWithProfiling,
             testDurationSeconds: testDuration,
             perTestCoverage: measured.perTestCoverage,
             coverage: measured.coverage
-        ))
+        )
+        established.control = control
+        return .established(established)
     }
 
     /// The one sentence every backend uses for "the unmutated suite ran and
@@ -158,6 +183,9 @@ public struct EstablishedBaseline: Sendable {
     public let testDurationSeconds: Double
     public let perTestCoverage: PerTestCoverageMap?
     public let coverage: CoverageMap?
+    /// Unmutated products kept for kill baseline controls; its creator
+    /// disposes of it (`BaselineControlSource.teardown`).
+    var control: BaselineControlSource?
 
     public init(record: BaselineRecord, testDurationSeconds: Double, perTestCoverage: PerTestCoverageMap?, coverage: CoverageMap?) {
         self.record = record

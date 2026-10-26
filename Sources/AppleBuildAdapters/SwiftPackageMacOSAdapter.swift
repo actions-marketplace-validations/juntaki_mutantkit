@@ -13,14 +13,35 @@ import SwiftFrontend
 /// from this adapter.
 public struct SwiftPackageMacOSAdapter: Sendable {
     let configuration: Configuration
+    /// Where each workspace sits inside its sandbox, which is how a build
+    /// finds the scratch root its shared module cache lives under. `nil`
+    /// means a project-only layout: the workspace is the container.
+    let sandboxLayout: SandboxLayout?
 
-    public init(configuration: Configuration) {
+    public init(configuration: Configuration, sandboxLayout: SandboxLayout? = nil) {
         self.configuration = configuration
+        self.sandboxLayout = sandboxLayout
     }
 
     /// Where SwiftPM leaves the test bundles.
     func productsDirectory(in workspace: URL) -> URL {
         workspace.appendingPathComponent(".build/debug", isDirectory: true)
+    }
+
+    /// Where the package under test actually lives inside `workspace` —
+    /// `workspace` itself when `project.path` is unset, empty, `"."`, or
+    /// absolute; `workspace` plus that (necessarily relative) path
+    /// otherwise. Mirrors `SwiftPMLiveSourceResolution.packageLocation`'s
+    /// resolution so the real `swift build`/`swift test` invocation runs
+    /// where plan-time discovery already decided the package lives, not at
+    /// the sandbox root (which has no `Package.swift` of its own when
+    /// `project.path` points at a subdirectory).
+    ///
+    /// Absolute paths are left unresolved: `workspace` is always a sandbox
+    /// clone of `--project-root`, and an absolute path can't express
+    /// "somewhere inside this sandbox".
+    func resolvedWorkspace(_ workspace: URL) -> URL {
+        ProjectPathResolution.packageDirectory(in: workspace, projectPath: configuration.project.path)
     }
 }
 
@@ -76,7 +97,7 @@ extension SwiftPackageMacOSAdapter: BuildAdapter {
     /// retry's own failure -- whatever it is -- propagates as the real,
     /// final answer rather than looping.
     private func buildWithSharedCacheRecovery(in workspace: URL) async throws -> BuildArtifact {
-        guard let cachePath = await resolvedModuleCachePath(for: workspace) else {
+        guard let cachePath = try await resolvedModuleCachePath(for: workspace) else {
             return try await build(in: workspace, extraArguments: [])
         }
         let extraArguments = Self.moduleCacheArguments(for: cachePath)
@@ -172,12 +193,36 @@ extension SwiftPackageMacOSAdapter: BuildAdapter {
     /// build already warmed, because a mutation never changes an import)
     /// was checked against the isolated backend's build shape, not
     /// schemata's.
-    private func resolvedModuleCachePath(for workspace: URL) async -> URL? {
+    ///
+    /// The scratch root comes from the layout, never from the workspace's
+    /// parent directory: a workspace nested in its container would
+    /// otherwise put a cache inside every container. A workspace that is
+    /// not where the layout says fails the build as infrastructure.
+    private func resolvedModuleCachePath(for workspace: URL) async throws -> URL? {
         guard configuration.execution.sharedModuleCache else { return nil }
-        return await SharedModuleCacheNamespace.shared.moduleCachePath(forSandbox: workspace, workingDirectory: workspace)
+        let scratchRoot: URL
+        do {
+            scratchRoot = try SandboxLayout.container(
+                ofWorkspace: workspace, workspaceRelativePath: sandboxLayout?.workspaceRelativePath ?? ""
+            ).deletingLastPathComponent()
+        } catch {
+            throw BuildFailure(
+                kind: .infrastructure,
+                diagnosis: "The shared module cache has no scratch root for this build: \(error)",
+                command: CommandRecording.record(
+                    executable: ToolPaths.xcrun, arguments: ["swift", "build", "--build-tests"],
+                    workingDirectory: workspace, result: nil
+                ),
+                output: ""
+            )
+        }
+        return await SharedModuleCacheNamespace.shared.moduleCachePath(scratchRoot: scratchRoot, workingDirectory: workspace)
     }
 
-    private func build(in workspace: URL, extraArguments: [String] = []) async throws -> BuildArtifact {
+    private func build(in rawWorkspace: URL, extraArguments: [String] = []) async throws -> BuildArtifact {
+        // Resolved once — every use below must agree on where the package is.
+        let workspace = resolvedWorkspace(rawWorkspace)
+
         // `--build-tests` so the test bundle exists before `swift test --skip-build`
         // runs. Without it the test step would silently rebuild, and the build and
         // test timings — which drive the adaptive mutant timeout — would be wrong.
@@ -220,7 +265,7 @@ extension SwiftPackageMacOSAdapter: BuildAdapter {
         let products = productsDirectory(in: workspace)
         return BuildArtifact(
             productsDirectory: products,
-            productHash: TestProductHasher.hash(productsDirectory: products),
+            productHash: TestProductHasher.hash(productsDirectory: products, workspaceRoot: workspace),
             // SwiftPM does not produce one; `swift test` needs no such handoff.
             xctestrunPath: nil,
             command: command
@@ -259,7 +304,7 @@ extension SwiftPackageMacOSAdapter: SchemataBuildable {
         context: SchemataBuildReceiptContext
     ) async throws -> SchemataBuildReceipt {
         let discovered = try SchemataBuiltImageInspection.inspect(productsDirectory: artifact.productsDirectory)
-        let graph = try await SwiftPMTargetResolver.resolveDependencyGraph(projectRoot: workspace)
+        let graph = try await SwiftPMTargetResolver.resolveDependencyGraph(projectRoot: resolvedWorkspace(workspace))
 
         // Keyed by the *request's own* `buildTarget` — the chunk planner's
         // already-authoritative identity — never a value this resolver
@@ -270,16 +315,28 @@ extension SwiftPackageMacOSAdapter: SchemataBuildable {
         // would make every later `CompilationUnitReceipt.buildTarget ==
         // request.buildTarget` lookup fail closed for the wrong reason.
         let buildTargetsByName = Dictionary(units.map { ($0.buildTarget.targetName, $0.buildTarget) }) { first, _ in first }
+        // Executables and dynamic libraries that statically link a requested target are final images too: a test
+        // may run one as a child process, and the mutation then activates there. Only products the dependency
+        // graph proves to contain one of the targets are inspected.
+        var candidates: [String: (name: String, kind: SwiftPMDependencyGraph.ProductKind)] = [:]
+        for target in buildTargetsByName.keys {
+            for product in graph.finalImageProducts(containing: target) { candidates[product.name] = product }
+        }
+        let productImages = try SchemataBuiltImageInspection.inspectProductImages(
+            candidates.values.sorted { $0.name < $1.name }, in: artifact.productsDirectory
+        )
         let resolvedByTarget = try SwiftPMCompilationUnitImageResolver.resolve(
-            targets: Set(buildTargetsByName.keys), graph: graph, discovered: discovered
+            targets: Set(buildTargetsByName.keys), graph: graph, discovered: discovered, productImages: productImages
         )
 
-        var imagesByTarget: [BuildTargetIdentity: BuiltImageReceipt] = [:]
-        for (targetName, image) in resolvedByTarget {
-            guard let buildTarget = buildTargetsByName[targetName] else { continue }
-            if imagesByTarget[buildTarget] == nil {
-                imagesByTarget[buildTarget] = try BuiltImageReceipt(
-                    buildTarget: buildTarget,
+        // One receipt per distinct built image (several targets may share the
+        // single combined bundle). The owner is left unset: which units an image
+        // contains is stated by each unit's `containingImageIDs`.
+        var imageByPath: [String: BuiltImageReceipt] = [:]
+        for images in resolvedByTarget.values {
+            for image in images where imageByPath[image.binaryPath] == nil {
+                imageByPath[image.binaryPath] = try BuiltImageReceipt(
+                    ownerBuildTarget: nil,
                     binaryPath: image.binaryPath,
                     contentHash: image.contentHash,
                     slices: image.slices
@@ -287,11 +344,13 @@ extension SwiftPackageMacOSAdapter: SchemataBuildable {
             }
         }
 
-        let compilationUnits = units.map {
-            CompilationUnitReceipt(
-                compilationUnitID: $0.compilationUnitID,
-                sourceEmbeddingID: $0.sourceEmbeddingID,
-                buildTarget: $0.buildTarget
+        let compilationUnits = units.map { request -> CompilationUnitReceipt in
+            let containing = (resolvedByTarget[request.buildTarget.targetName] ?? []).compactMap { imageByPath[$0.binaryPath]?.imageID }
+            return CompilationUnitReceipt(
+                compilationUnitID: request.compilationUnitID,
+                sourceEmbeddingID: request.sourceEmbeddingID,
+                sourceBuildTarget: request.buildTarget,
+                containingImageIDs: containing
             )
         }
 
@@ -302,7 +361,7 @@ extension SwiftPackageMacOSAdapter: SchemataBuildable {
             toolchainHash: context.toolchainHash,
             buildArgumentsHash: context.buildArgumentsHash,
             runtimeABIVersion: UInt32(BoolLiteralSchemataLowerer.runtimeABIVersion),
-            images: Array(imagesByTarget.values),
+            images: Array(imageByPath.values),
             compilationUnits: compilationUnits
         )
     }
@@ -365,7 +424,7 @@ extension SwiftPackageMacOSAdapter: TestAdapter {
     }
 
     private func runTests(
-        in workspace: URL,
+        in rawWorkspace: URL,
         timeoutSeconds: Double,
         enableCoverage: Bool = false,
         skipBuild: Bool? = nil,
@@ -374,6 +433,12 @@ extension SwiftPackageMacOSAdapter: TestAdapter {
         reliableExpectedTestCount: Int? = nil,
         scratchPath: URL? = nil
     ) async throws -> TestRunResult {
+        // Resolved only for an ordinary sandboxed run (`scratchPath == nil`);
+        // a `scratchPath` call already passes an explicitly-resolved
+        // `--package-path` (see `runConfirmationRetest`), so resolving again
+        // here would join `project.path` a second time.
+        let workspace = scratchPath == nil ? resolvedWorkspace(rawWorkspace) : rawWorkspace
+
         // Written inside `scratchPath` when one is given (a disposable
         // confirmation clone), `workspace` otherwise -- `workspace` can now
         // be the read-only `projectRoot` (see `scratchPath` below).
@@ -500,8 +565,12 @@ extension SwiftPackageMacOSAdapter: PackageManifestConfirmationRetesting {
         timeoutSeconds: Double,
         selectedTests: Set<TestIdentifier>?
     ) async throws -> TestRunResult {
+        // `packageRoot` is the real, unsandboxed `--project-root`, so it
+        // needs the same `project.path` join `resolvedWorkspace(_:)` applies
+        // everywhere else — `scratchPath` below tells `runTests` it's
+        // already resolved, so it won't do this itself.
         try await runTests(
-            in: packageRoot,
+            in: resolvedWorkspace(packageRoot),
             timeoutSeconds: timeoutSeconds,
             enableCoverage: false,
             testFilters: Self.testFilterArguments(for: selectedTests),
@@ -543,16 +612,18 @@ extension SwiftPackageMacOSAdapter: SchemataTestable {
 extension SwiftPackageMacOSAdapter: CoverageMeasuring {
     public func readCoverage(in workspace: URL, projectRoot: URL) async -> CoverageMap? {
         // SwiftPM writes codecov JSON under `.build/<arch>/<build>/codecov/`.
-        // `.build/debug` is normally a symlink to the real path; resolving it
-        // is what makes the enumerator actually descend (HANDOVER §3-3).
-        let buildDir = productsDirectory(in: workspace).resolvingSymlinksInPath()
+        // `.build/debug` is normally a symlink; resolving it is what makes
+        // the enumerator actually descend. Resolved via
+        // `resolvedWorkspace(_:)` since that's where the build actually ran.
+        let buildDir = productsDirectory(in: resolvedWorkspace(workspace)).resolvingSymlinksInPath()
         let codecovDir = buildDir.appendingPathComponent("codecov", isDirectory: true)
-        // The codecov paths are absolute and rooted at the *sandbox*, because
-        // that is where the instrumented binary was built. The plan, however,
-        // uses repository-relative paths, and the sandbox is a verbatim copy of
-        // the project tree — so stripping the *workspace* prefix (not the
-        // caller's `projectRoot`) yields the same repo-relative shape the plan
-        // uses. Passing `projectRoot` here would match nothing.
+        // Codecov paths are absolute, rooted at the sandbox where the build
+        // ran. The plan uses repo-relative paths, and the sandbox is a
+        // verbatim copy of the project tree, so stripping the raw
+        // `workspace` prefix (not `resolvedWorkspace(workspace)` or the
+        // caller's `projectRoot`) keeps whatever `project.path` prefix the
+        // plan itself expects.
+        await SwiftPMTestBundleCoverageExport.refresh(productsDirectory: buildDir, codecovDirectory: codecovDir)
         return SourceCoverageReader.read(directory: codecovDir, projectRoot: workspace)
     }
 }
@@ -668,7 +739,7 @@ extension SwiftPackageMacOSAdapter: TestSelecting {
         timeoutSeconds: Double
     ) async -> PerTestCoverageMap? {
         let enumerated = await Self.enumerateTestIdentifiers(
-            in: workspace,
+            in: resolvedWorkspace(workspace),
             timeoutSeconds: timeoutSeconds,
             terminationGracePeriodSeconds: configuration.timeouts.terminationGracePeriodSeconds
         )
@@ -688,17 +759,21 @@ extension SwiftPackageMacOSAdapter: TestSelecting {
         // be proven are all `PerTestCoverageAttribution.attribute`'s -- see
         // its doc comment. What is adapter-specific, and all that is left
         // here, is how one test is run and how its coverage is read back.
-        return await PerTestCoverageAttribution.attribute(
-            tests: tests, source: "swiftpm-codecov-per-test",
-            progress: ProgressReporter(total: tests.count, label: "per-test coverage")
-        ) { test, _ in
+        let granularity = configuration.execution.coverageGranularity
+        let suiteSizes = Self.suiteSizes(of: tests)
+        let attempts = 2
+        let suiteMemo = SuiteCoverageMemo()
+
+        // One test, or (`coverageGranularity: suite`) one whole suite, run in
+        // isolation with coverage; the coverage read back is what gets credited.
+        func measure(_ unit: CoverageUnit) async -> CoverageMap? {
             guard let run = try? await runTests(
                 in: workspace,
                 timeoutSeconds: timeoutSeconds,
                 enableCoverage: true,
                 skipBuild: coverageArtifactBuilt,
-                testFilters: [test.swiftTestFilterArgument],
-                reliableExpectedTestCount: test.isSwiftTestingShaped ? 1 : nil
+                testFilters: [unit.filter],
+                reliableExpectedTestCount: unit.expectedTestCount
             ) else { return nil }
             // `runTests`'s xunit report path is unique per invocation (never
             // reused by a later iteration), and this loop -- unlike a real
@@ -707,11 +782,43 @@ extension SwiftPackageMacOSAdapter: TestSelecting {
             // project with many discovered tests would otherwise accumulate
             // one report pair per test, for the lifetime of this whole
             // method's loop, inside one sandbox.
+            let skippedCount = run.resultArtifactPath.flatMap { XUnitParser.swiftTestingSkippedCount(forRequestedOutput: $0) }
             Self.removeXUnitReports(at: run.resultArtifactPath)
+            // Tests that ran as skipped execute nothing, here and in every mutant run under the same
+            // configuration, so they cover nothing. Leaving them unattributed would put them in every
+            // mutant's selection, where they can never run and fail the shortfall check.
+            if run.status == .infrastructureFailure,
+               Self.allSelectedTestsSkipped(skippedCount: skippedCount, expectedTestCount: unit.expectedTestCount) {
+                return CoverageMap(executedLines: [:], source: "swiftpm-codecov-per-test")
+            }
             guard run.status == .passed else { return nil }
 
             guard let map = await readCoverage(in: workspace, projectRoot: workspace) else { return nil }
             coverageArtifactBuilt = true
+            return map
+        }
+
+        return await PerTestCoverageAttribution.attribute(
+            tests: tests, source: "swiftpm-codecov-per-test", attempts: attempts,
+            progress: ProgressReporter(total: tests.count, label: "per-test coverage")
+        ) { test, attemptNumber in
+            let unit = Self.coverageUnit(for: test, granularity: granularity, suiteSizes: suiteSizes)
+            guard let suiteKey = unit.suiteKey else { return await measure(unit) }
+
+            // A suite is run once and its outcome shared by every test in it.
+            // A failure is only remembered after the last attempt, so the
+            // retry policy still gets its second try at the suite.
+            switch suiteMemo.outcome(for: suiteKey) {
+            case let .measured(map): return map
+            case .failed: return nil
+            case nil: break
+            }
+            let map = await measure(unit)
+            if let map {
+                suiteMemo.record(.measured(map), for: suiteKey)
+            } else if attemptNumber >= attempts {
+                suiteMemo.record(.failed, for: suiteKey)
+            }
             return map
         }
     }
@@ -785,7 +892,7 @@ extension SwiftPackageMacOSAdapter: TestSelecting {
     }
 }
 
-private extension TestIdentifier {
+extension TestIdentifier {
     /// The exact string `swift test --filter` accepts for exactly this one
     /// test: an anchored regex over the same `<target>.<Class>/<method>`
     /// shape `swift test list` itself emits (see
@@ -844,10 +951,30 @@ public struct SwiftPackageMacOSProjectAdapter: ProjectAdapter {
     public let kind: ProjectKind = .swiftPackageMacOS
     public let build: any BuildAdapter
     public let test: any TestAdapter
+    /// Populated from the same `SwiftPackageMacOSAdapter` instance
+    /// `build`/`test` already share — zero `as?`, a compile-time-checked
+    /// upcast. `batchTestable`/`schemataBatchTestable` are left at
+    /// `ProjectAdapter`'s own `nil` default: `SwiftPackageMacOSAdapter`
+    /// does not conform to `BatchTestable`/`SchemataBatchTestable` (no
+    /// such extension exists in this file — confirmed by grep, and a real,
+    /// load-bearing difference `ExecutionCapabilitiesDiagnosis
+    /// .testBatchingItem`'s `is` checks already depend on), so no upcast is
+    /// possible here — the compiler would refuse one that doesn't hold,
+    /// itself a permanent, free check that a future `BatchTestable`
+    /// conformance can't be added to the adapter body without this file
+    /// being updated too.
+    public let schemataBuild: (any SchemataBuildable)?
+    public let schemataTest: (any SchemataTestable)?
+    public let coverageMeasuring: (any CoverageMeasuring)?
+    public let testSelecting: (any TestSelecting)?
 
-    public init(configuration: Configuration) {
-        let adapter = SwiftPackageMacOSAdapter(configuration: configuration)
+    public init(configuration: Configuration, sandboxLayout: SandboxLayout? = nil) {
+        let adapter = SwiftPackageMacOSAdapter(configuration: configuration, sandboxLayout: sandboxLayout)
         build = adapter
         test = adapter
+        schemataBuild = adapter
+        schemataTest = adapter
+        coverageMeasuring = adapter
+        testSelecting = adapter
     }
 }

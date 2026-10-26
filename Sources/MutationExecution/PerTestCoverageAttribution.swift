@@ -42,7 +42,7 @@ public enum PerTestCoverageAttribution {
         tests: [TestIdentifier],
         source: String,
         attempts: Int = 2,
-        progress: ProgressReporter? = nil,
+        progress: MutationModel.ProgressReporter? = nil,
         attempt: (TestIdentifier, Int) async -> CoverageMap?
     ) async -> PerTestCoverageMap? {
         var coveringTests: [String: [Int: Set<TestIdentifier>]] = [:]
@@ -56,6 +56,8 @@ public enum PerTestCoverageAttribution {
             }
             if let measured {
                 for (file, lines) in measured.executedLines {
+                    // Kept even when empty, so `aggregate()` can say "never reached" for the file.
+                    if lines.isEmpty { coveringTests[file, default: [:]] = coveringTests[file] ?? [:] }
                     for line in lines {
                         coveringTests[file, default: [:]][line, default: []].insert(test)
                     }
@@ -70,7 +72,7 @@ public enum PerTestCoverageAttribution {
             await progress?.recordCompletion()
         }
 
-        guard !coveringTests.isEmpty else { return nil }
+        guard coveringTests.values.contains(where: { !$0.isEmpty }) else { return nil }
         return PerTestCoverageMap(
             coveringTests: coveringTests, source: source, unattributedTests: unattributedTests
         )

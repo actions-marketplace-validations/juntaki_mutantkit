@@ -45,11 +45,17 @@ struct MutationRunnerIncrementalBuildTests {
         try Data("struct A { var enabled = true; var visible = false }".utf8).write(to: url)
     }
 
+    private struct RunOutcome {
+        let report: RunReport
+        let build: SpyBuildAdapter
+        let test: SpyTestAdapter
+    }
+
     private func run(
         incrementalBuild: Bool,
         confirmCrashKills: Bool = false,
         mutantSequence: [TestRunStatus]
-    ) async throws -> (RunReport, SpyBuildAdapter, SpyTestAdapter) {
+    ) async throws -> RunOutcome {
         try writeTwoMutantProject()
 
         let configuration = Configuration(
@@ -76,12 +82,14 @@ struct MutationRunnerIncrementalBuildTests {
             workspaces: workspaces
         )
         let report = try await runner.run()
-        return (report, build, test)
+        return RunOutcome(report: report, build: build, test: test)
     }
 
     @Test("incrementalBuild off: each mutant still gets its own fresh sandbox")
     func nonIncrementalUsesAFreshSandboxPerMutant() async throws {
-        let (report, build, _) = try await run(incrementalBuild: false, mutantSequence: [.failed, .failed])
+        let outcome = try await run(incrementalBuild: false, mutantSequence: [.failed, .failed])
+        let report = outcome.report
+        let build = outcome.build
 
         #expect(report.results.count == 2)
         #expect(report.results.allSatisfy { $0.outcome == .killedByAssertion })
@@ -103,7 +111,9 @@ struct MutationRunnerIncrementalBuildTests {
 
     @Test("incrementalBuild on, one worker: both mutants build in the same reused sandbox")
     func incrementalBuildReusesOneSandboxAcrossMutants() async throws {
-        let (report, build, _) = try await run(incrementalBuild: true, mutantSequence: [.failed, .failed])
+        let outcome = try await run(incrementalBuild: true, mutantSequence: [.failed, .failed])
+        let report = outcome.report
+        let build = outcome.build
 
         #expect(report.results.count == 2)
         // Both scored normally — not `.notApplied` — which is the outcome a
@@ -118,33 +128,48 @@ struct MutationRunnerIncrementalBuildTests {
 
     @Test("incrementalBuild on: the baseline still builds in its own sandbox, not a worker's")
     func baselineSandboxIsNeverAWorkerSandbox() async throws {
-        let (_, build, _) = try await run(incrementalBuild: true, mutantSequence: [.failed, .failed])
+        let outcome = try await run(incrementalBuild: true, mutantSequence: [.failed, .failed])
+        let build = outcome.build
 
         let baselineWorkspace = try #require(await build.buildBaselineCalls.first)
         let mutantWorkspaces = Set(await build.buildMutantCalls.map(\.workspace))
         #expect(!mutantWorkspaces.contains(baselineWorkspace))
     }
 
-    @Test("incrementalBuild on, confirmCrashKills on: the confirmation rebuild still gets its own independent sandbox")
+    @Test("incrementalBuild on, confirmCrashKills on: the confirmation rebuilds never use a worker sandbox, and share one of their own")
     func confirmationStaysIndependentUnderIncrementalBuild() async throws {
-        let (report, build, _) = try await run(
+        let outcome = try await run(
             incrementalBuild: true, confirmCrashKills: true, mutantSequence: [.crashed, .crashed, .crashed, .crashed]
         )
+        let report = outcome.report
+        let build = outcome.build
 
+        // The second confirmation rebuilt in the pooled sandbox after the first one's edit was
+        // restored; a failed restore would have left its anchor rejected (`.notApplied`).
         #expect(report.results.count == 2)
         #expect(report.results.allSatisfy { $0.outcome == .killedByCrash })
 
         // Four builds total: two originals (the shared worker sandbox) and
-        // two independent crash confirmations (their own, one-off sandboxes).
+        // two crash confirmations.
         #expect(await build.buildMutantCalls.count == 4)
         let workspaces = await build.buildMutantCalls.map(\.workspace)
         let sharedWorkerWorkspace = workspaces[0]
-        // The two confirmation rebuilds must not land in the shared worker
-        // sandbox, and must not share a sandbox with each other either —
-        // each crash confirmation is its own fresh, independent rebuild.
+        // The confirmation rebuilds must not land in the worker sandbox, where the primary run
+        // happened; one after the other they reuse a sandbox of their own, so only the first pays
+        // for a cold build.
         let confirmationWorkspaces = workspaces.filter { $0 != sharedWorkerWorkspace }
         #expect(confirmationWorkspaces.count == 2)
-        #expect(Set(confirmationWorkspaces).count == 2, "each confirmation must be independently sandboxed")
+        #expect(Set(confirmationWorkspaces).count == 1, "sequential confirmations reuse one pooled sandbox")
+    }
+
+    @Test("incrementalBuild off, confirmCrashKills on: each confirmation still gets a fresh sandbox of its own")
+    func confirmationsAreFreshWithoutIncrementalBuild() async throws {
+        let outcome = try await run(
+            incrementalBuild: false, confirmCrashKills: true, mutantSequence: [.crashed, .crashed, .crashed, .crashed]
+        )
+        let workspaces = await outcome.build.buildMutantCalls.map(\.workspace)
+        #expect(workspaces.count == 4)
+        #expect(Set(workspaces).count == 4, "no sandbox is reused outside an incremental run")
     }
 }
 

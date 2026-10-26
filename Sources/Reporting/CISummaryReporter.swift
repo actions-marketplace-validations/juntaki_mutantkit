@@ -17,6 +17,13 @@ public struct CISummaryReporter: Reporter {
 
     public func render(_ report: RunReport) throws -> String {
         var out = ["## Mutation testing"]
+        if let interruption = report.interruption {
+            out.append(
+                "> [!WARNING]\n> **Partial result** — interrupted by \(interruption.signal) after "
+                    + "\(interruption.completedMutants) of \(interruption.plannedMutants) mutants. "
+                    + "Not a trustworthy measurement; resume the run to finish it."
+            )
+        }
 
         out.append(scoreSection(report))
         out.append(outcomeTable(report))
@@ -103,7 +110,8 @@ public struct CISummaryReporter: Reporter {
             .filter { $0.reason != .mutationSiteNotCovered }
 
         guard !rows.isEmpty else {
-            return report.score == nil ? "" : "No mutants survived."
+            guard report.score != nil else { return "" }
+            return report.integrity.executed == 0 ? "No mutants were executed." : "No mutants survived."
         }
 
         let aggregate = rows.aggregate

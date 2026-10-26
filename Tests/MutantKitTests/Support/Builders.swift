@@ -39,6 +39,28 @@ func makeToolchain(
     )
 }
 
+/// A baseline control the verifier accepts: the unmutated build ran the same
+/// tests and every one passed.
+func makePassingBaselineControl(selectedTests: [String]? = nil) -> BaselineControlObservation {
+    BaselineControlObservation(
+        method: .unmutatedBuildProducts,
+        run: TestRunResult(
+            status: .passed, summary: makeTestSummary(),
+            command: CommandRecord(executable: "swift", arguments: ["test"], workingDirectory: "/tmp"),
+            resultArtifactPath: nil, diagnosis: "control passed"
+        ),
+        selectedTests: selectedTests
+    )
+}
+
+/// The structured control a confirmed kill carries once the verifier has judged
+/// `makePassingBaselineControl()`.
+func makePassedControl() -> AssertionKillConfirmation.Control {
+    AssertionKillConfirmation.Control(
+        status: .passedOnBaseline, method: .unmutatedBuildProducts, runStatus: "passed", selectedTestCount: nil, failingTests: []
+    )
+}
+
 func makeTestSummary(total: Int = 10, passed: Int = 10, failed: Int = 0) -> TestOutcomeSummary {
     TestOutcomeSummary(
         total: total,
@@ -49,14 +71,16 @@ func makeTestSummary(total: Int = 10, passed: Int = 10, failed: Int = 0) -> Test
     )
 }
 
-func makeBaseline(passed: Bool = true) -> BaselineRecord {
+func makeBaseline(passed: Bool = true, coverageMeasured: Bool = false, coverageReused: Bool = false) -> BaselineRecord {
     BaselineRecord(
         passed: passed,
         testSummary: passed ? makeTestSummary() : makeTestSummary(passed: 9, failed: 1),
         durationSeconds: 12,
         buildProductHash: ContentHash.of("baseline-binary"),
         buildCommand: nil,
-        testCommand: nil
+        testCommand: nil,
+        profilingDurationSeconds: coverageMeasured ? 3 : nil,
+        coverageReused: coverageReused ? true : nil
     )
 }
 
@@ -112,7 +136,7 @@ func makeEvidence(
     )
 }
 
-// MARK: - Schemata fixtures (ADR-0006 Stage 2: raw observations only)
+// MARK: - Schemata fixtures (the schemata proof chain: raw observations only)
 
 let schemataFixtureCompilationUnitID = CompilationUnitID.derive(
     projectIdentity: "proj", target: "App", module: "App", sourcePath: "Widget.swift", lowererID: "bool-literal", lowererVersion: 1
@@ -133,26 +157,36 @@ func makeSchemataFixtureReceipt() -> SchemataBuildReceipt {
         compilationUnitID: schemataFixtureCompilationUnitID, sourceEmbeddingID: schemataFixtureSourceEmbeddingID,
         buildTarget: schemataFixtureBuildTarget
     )
-    let image = try! BuiltImageReceipt(
-        buildTarget: schemataFixtureBuildTarget, binaryPath: "/build/App", contentHash: SHA256Digest.of("app-binary"),
-        slices: [BuiltImageSlice(architecture: BuiltArchitectureIdentity(cpuType: 0x0100_000C, cpuSubtype: 0), imageUUID: schemataFixtureImageUUID)]
-    )
-    return try! SchemataBuildReceipt(
-        planID: "plan-1", workUnitID: "wu-1", chunkID: "chunk-1", toolchainHash: SHA256Digest.of("toolchain"),
-        buildArgumentsHash: SHA256Digest.of("args"), runtimeABIVersion: 3, images: [image], compilationUnits: [unit]
-    )
+    let image: BuiltImageReceipt
+    let receipt: SchemataBuildReceipt
+    do {
+        let architecture = BuiltArchitectureIdentity(cpuType: 0x0100_000C, cpuSubtype: 0)
+        image = try BuiltImageReceipt(
+            buildTarget: schemataFixtureBuildTarget, binaryPath: "/build/App", contentHash: SHA256Digest.of("app-binary"),
+            slices: [BuiltImageSlice(architecture: architecture, imageUUID: schemataFixtureImageUUID)]
+        )
+        receipt = try SchemataBuildReceipt(
+            planID: "plan-1", workUnitID: "wu-1", chunkID: "chunk-1", toolchainHash: SHA256Digest.of("toolchain"),
+            buildArgumentsHash: SHA256Digest.of("args"), runtimeABIVersion: 3, images: [image], compilationUnits: [unit]
+        )
+    } catch {
+        fatalError("schemata fixture receipt must be self-consistent: \(error)")
+    }
+    return receipt
 }
 
 private func schemataFixtureStartup(processID: Int32 = 4242) -> RuntimeStartupEvent {
     RuntimeStartupEvent(
-        runID: schemataFixtureRunID, sourceEmbeddingID: schemataFixtureSourceEmbeddingID, compilationUnitID: schemataFixtureCompilationUnitID,
+        runID: schemataFixtureRunID, sourceEmbeddingID: schemataFixtureSourceEmbeddingID,
+        compilationUnitID: schemataFixtureCompilationUnitID,
         token: schemataFixtureToken, processID: processID, imageUUID: schemataFixtureImageUUID, runtimeABIVersion: 3
     )
 }
 
 private func schemataFixtureHit(processID: Int32 = 4242, sequence: UInt64 = 1) -> RuntimeHitEvent {
     RuntimeHitEvent(
-        runID: schemataFixtureRunID, sourceEmbeddingID: schemataFixtureSourceEmbeddingID, compilationUnitID: schemataFixtureCompilationUnitID,
+        runID: schemataFixtureRunID, sourceEmbeddingID: schemataFixtureSourceEmbeddingID,
+        compilationUnitID: schemataFixtureCompilationUnitID,
         token: schemataFixtureToken, processID: processID, sequence: sequence, imageUUID: schemataFixtureImageUUID, runtimeABIVersion: 3
     )
 }
@@ -238,7 +272,7 @@ func makeSchemataConfirmationObservation(
 /// verifier itself. Goes through the real `VerdictProof`/
 /// `VerifiedMutationRecord`/`MutationResult.projected` path (via
 /// `@testable import`, since `VerifiedMutationRecord` has no public
-/// initializer by design — ADR-0006 Stage 1) so a fabricated result is
+/// initializer by design — the authoritative verdict pipeline) so a fabricated result is
 /// still shaped exactly like a real verified one, just with the proof case
 /// picked directly from `outcome` instead of derived from observations.
 func makeResult(
@@ -257,9 +291,18 @@ func makeResult(
     durationSeconds: Double = 2,
     buildDurationSeconds: Double? = nil,
     testDurationSeconds: Double? = nil,
-    confirmationDurationSeconds: Double? = nil
+    confirmationDurationSeconds: Double? = nil,
+    attributeKill: Bool = true
 ) -> MutationResult {
     let ref = PlannedMutationRef.forPoint(point, planID: planID, workUnitID: workUnitID)
+    var evidence = evidence
+    if attributeKill, outcome == .killedByAssertion, let recorded = evidence, recorded.assertionKillAttribution == nil {
+        // A verified assertion kill always carries its attribution; the
+        // fixture mimics that unless a test opts out to model a stripped record.
+        evidence = recorded.withAssertionKillAttribution(
+            .evaluate(execution: wholeSuiteExecution, failingTests: testSummary?.failingTests)
+        )
+    }
     let proof: VerdictProof = switch outcome {
     case .killedByAssertion, .killedByCrash, .verifiedTimeout, .survived:
         .executed(ExecutedMutationProof(
@@ -283,6 +326,23 @@ func makeResult(
     )
 }
 
+extension MutationEvidence {
+    func withAssertionKillAttribution(_ attribution: AssertionKillAttribution?) -> MutationEvidence {
+        MutationEvidence(
+            sourceBeforeHash: sourceBeforeHash, sourceAfterHash: sourceAfterHash, sourceDiff: sourceDiff,
+            buildProductHash: buildProductHash, applicationEvidence: applicationEvidence,
+            buildCommand: buildCommand, testCommand: testCommand, resultArtifact: resultArtifact,
+            crashConfirmation: crashConfirmation, timeoutConfirmation: timeoutConfirmation,
+            testAttempts: testAttempts, assertionKillConfirmation: assertionKillConfirmation,
+            assertionKillAttribution: attribution, confirmationChain: confirmationChain
+        )
+    }
+}
+
+/// A recorded execution for a test run that ran the full configured list,
+/// standalone — the minimum an assertion kill needs to be credited.
+let wholeSuiteExecution = TestExecutionRecord(attribution: .standalone, selection: .wholeSuite)
+
 private func makeCommand() -> CommandRecord {
     CommandRecord(executable: "swift", arguments: ["test"], workingDirectory: "/tmp")
 }
@@ -291,7 +351,7 @@ private func makeCommand() -> CommandRecord {
 /// actually classifies to `outcome` — for tests exercising
 /// `MutationResultCache`/`CheckpointStore`, which now store and re-verify
 /// raw observations rather than an already-decided `MutationResult`
-/// (ADR-0006 Stage 1, second review round). Only covers the outcomes the
+/// (the authoritative verdict pipeline, second review round). Only covers the outcomes the
 /// verifier can actually produce from observations — `.baselineMismatch`
 /// and `.skipped` are never emitted by `verify` itself (both are set
 /// elsewhere: a failed baseline invalidates a whole run in
@@ -324,7 +384,10 @@ func makeObservations(
         return MutationObservations(
             plannedMutation: ref, sourceApplication: .applied(evidence),
             build: BuildObservation(outcome: .succeeded(buildProductHash: ContentHash.of("mutant-binary"), command: makeCommand())),
-            test: SingleTestObservation(run: run(.failed), applicationEvidence: provenActivation)
+            test: SingleTestObservation(
+                run: run(.failed), applicationEvidence: provenActivation,
+                execution: TestExecutionRecord(attribution: .standalone, selection: .wholeSuite)
+            )
         )
     case .killedByCrash:
         return MutationObservations(
@@ -370,6 +433,14 @@ func makeObservations(
         return MutationObservations(plannedMutation: ref, sourceApplication: .notApplied(diagnosis: "anchor rejected"))
     case .infrastructureFailure:
         return MutationObservations(plannedMutation: ref, infrastructureFailureDiagnosis: "infrastructure failure")
+    case .notMaterialized:
+        // The runner's shape for a product identical to the baseline's: the
+        // edit is applied, the build succeeded, the tests were not run.
+        let identical = makeEvidence(activation: .buildProductIdenticalToBaseline(hash: ContentHash.of("mutant-binary")))
+        return MutationObservations(
+            plannedMutation: ref, sourceApplication: .applied(identical),
+            build: BuildObservation(outcome: .succeeded(buildProductHash: ContentHash.of("mutant-binary"), command: makeCommand()))
+        )
     case .baselineMismatch, .skipped:
         preconditionFailure("\(outcome) is never emitted by MutationVerdictVerifier.verify — see this function's doc comment")
     }
@@ -392,7 +463,9 @@ func makeLedger(_ results: [MutationResult]) -> ResultLedger<MutationResult> {
 func makeReport(
     plan: MutationPlan,
     results: [MutationResult],
-    baselinePassed: Bool = true
+    baselinePassed: Bool = true,
+    coverageMeasured: Bool = false,
+    coverageReused: Bool = false
 ) -> RunReport {
     RunReport(
         planID: plan.planID,
@@ -400,7 +473,7 @@ func makeReport(
         finishedAt: Date(timeIntervalSince1970: 1_700_000_100),
         projectRoot: plan.projectRoot,
         toolchain: makeToolchain(),
-        baseline: makeBaseline(passed: baselinePassed),
+        baseline: makeBaseline(passed: baselinePassed, coverageMeasured: coverageMeasured, coverageReused: coverageReused),
         ledger: makeLedger(results),
         integrity: IntegrityChecker.check(plan: plan, ledger: makeLedger(results), baselinePassed: baselinePassed)
     )

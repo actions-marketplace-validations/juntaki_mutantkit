@@ -140,19 +140,12 @@ struct LogicalConnectorReplacementSchemataLowererTests {
         #expect(reason == .controlFlowConstant)
     }
 
-    @Test("A function-call operand falls back to isolated — the common `isValid() && hasPermission()` shape")
-    func functionCallOperandFallsBack() throws {
+    @Test("A function-call operand is eligible — the common `isValid() && hasPermission()` shape")
+    func functionCallOperandIsEligible() throws {
         let source = "func lhs() -> Bool { true }\nfunc f(b: Bool) -> Bool { lhs() && b }"
         let mutation = try point(source, replacement: "||")
         let eligibility = lowerer.analyze(mutation, source: Data(source.utf8))
-        guard case let .isolatedOnly(reason) = eligibility else {
-            Issue.record("expected .isolatedOnly, got \(eligibility)")
-            return
-        }
-        guard case .unsupportedOperand = reason else {
-            Issue.record("expected .unsupportedOperand, got \(reason)")
-            return
-        }
+        #expect(eligibility.isEligible, "the lowering runs the call once, in the selected arm")
     }
 
     @Test("A try operand falls back to isolated")
@@ -184,7 +177,9 @@ struct LogicalConnectorReplacementSchemataLowererTests {
         let source = "func f(a: Bool, b: Bool, c: Bool, d: Bool) -> Bool { (a && b) || (c && d) }"
         let points = try discover(source, path: "Sample.swift", using: Operators.logicalConnector)
         #expect(!points.isEmpty)
-        let variants = points.map { LogicalConnectorMutationVariant(originalOperator: $0.originalText, replacementOperator: $0.replacementText) }
+        let variants = points.map {
+            LogicalConnectorMutationVariant(originalOperator: $0.originalText, replacementOperator: $0.replacementText)
+        }
         let knownPairs: Set<LogicalConnectorMutationVariant> = [
             .init(originalOperator: "&&", replacementOperator: "||"),
             .init(originalOperator: "||", replacementOperator: "&&")

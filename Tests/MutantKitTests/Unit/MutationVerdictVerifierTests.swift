@@ -2,54 +2,31 @@ import Foundation
 import MutationModel
 import Testing
 
-/// ADR-0006 Stage 1: `MutationVerdictVerifier.verify(_:MutationObservations)`
+/// The authoritative verdict pipeline: `MutationVerdictVerifier.verify(_:MutationObservations)`
 /// is now the sole place a mutation's outcome is decided — this pins its
 /// full decision table, covering every distinct branch the verifier's
 /// logic takes (ported from `ResultClassifier`/`SchemataResultClassifier`,
 /// which this suite replaces). Not a literal combinatorial matrix of every
 /// field × every field, but every branch a reader of the verifier's source
 /// would need to trust is correct.
-@Suite("Mutation verdict verifier decision table (ADR-0006 Stage 1)")
+@Suite("Mutation verdict verifier decision table")
 struct MutationVerdictVerifierTests {
-    private static let planID = "plan-A"
-    private static let workUnitID = "unit-1"
-
-    private func ref(for point: MutationPoint) -> PlannedMutationRef {
-        PlannedMutationRef.forPoint(point, planID: Self.planID, workUnitID: Self.workUnitID)
-    }
-
-    private func verify(
-        policy: MutationVerdictVerifier.VerdictVerificationPolicy = .permissive,
-        _ obs: (PlannedMutationRef) -> MutationObservations
-    ) throws -> VerifiedMutationRecord {
-        let point = try makeAnchoredPoint()
-        return MutationVerdictVerifier.verify(obs(ref(for: point)), policy: policy)
-    }
-
-    private func run(status: TestRunStatus, summary: TestOutcomeSummary? = nil, isBatchAttributedTimeout: Bool = false) -> TestRunResult {
-        TestRunResult(
-            status: status, summary: summary,
-            command: CommandRecord(executable: "/usr/bin/true", arguments: [], workingDirectory: "/tmp"),
-            resultArtifactPath: nil, diagnosis: "diag:\(status.rawValue)",
-            isBatchAttributedTimeout: isBatchAttributedTimeout
-        )
-    }
-
-    private var provenIsolated: ActivationEvidence { .buildProductDiffersFromBaseline(mutantHash: "h1", baselineHash: "h0") }
-    private var unprovenIsolated: ActivationEvidence { .buildProductIdenticalToBaseline(hash: "h0") }
-
     // MARK: - Source application
 
     @Test("notApplied when the anchor was rejected")
     func notApplied() throws {
-        let record = try verify { ref in MutationObservations(plannedMutation: ref, sourceApplication: .notApplied(diagnosis: "anchor moved")) }
+        let record = try verify { ref in
+            MutationObservations(plannedMutation: ref, sourceApplication: .notApplied(diagnosis: "anchor moved"))
+        }
         #expect(record.outcome == .notApplied)
         guard case .excluded = record.proof else { Issue.record("expected .excluded"); return }
     }
 
     @Test("infrastructureFailure when nothing was even attempted")
     func nothingAttempted() throws {
-        let record = try verify { ref in MutationObservations(plannedMutation: ref, infrastructureFailureDiagnosis: "sandbox could not be created") }
+        let record = try verify { ref in
+            MutationObservations(plannedMutation: ref, infrastructureFailureDiagnosis: "sandbox could not be created")
+        }
         #expect(record.outcome == .infrastructureFailure)
     }
 
@@ -138,9 +115,7 @@ struct MutationVerdictVerifierTests {
         #expect(!record.outcome.isCacheableResult)
     }
 
-    /// Found by this project's own P7 self-mutation audit
-    /// (this project's internal mutation-testing-hardening progress log,
-    /// not part of this public repo):
+    /// Found by this project's own self-mutation audit:
     /// `executionEvidenceProblem`'s own build-product-hash guard (the one
     /// right above the isolated-activation checks the three tests above
     /// exercise) had no dedicated test. Mutating its `return` to `return
@@ -239,7 +214,12 @@ struct MutationVerdictVerifierTests {
         }
         #expect(record.outcome == .infrastructureFailure)
     }
+}
 
+/// `MutationVerdictVerifierTests`, by decision-table area: isolated-mode primary verdicts (failed, crashed,
+/// timedOut, passed, notMaterialized).
+@Suite("Mutation verdict verifier: isolated mode")
+struct MutationVerdictVerifierIsolatedTests {
     // MARK: - Isolated mode: failed/crashed/timedOut
 
     @Test("killedByAssertion: failed with proven activation")
@@ -248,7 +228,9 @@ struct MutationVerdictVerifierTests {
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed), applicationEvidence: .isolated(provenIsolated))
+                test: SingleTestObservation(
+                    run: run(status: .failed), applicationEvidence: .isolated(provenIsolated), execution: wholeSuiteExecution
+                )
             )
         }
         #expect(record.outcome == .killedByAssertion)
@@ -362,8 +344,20 @@ struct MutationVerdictVerifierTests {
         #expect(record.outcome == .infrastructureFailure)
     }
 
-    @Test("infrastructureFailure: passed, activation unproven (build identical to baseline) — not scored, not cached")
-    func isolatedPassedUnprovenIsInfrastructureFailure() throws {
+    @Test("a build failure recorded as a confirmed compiler crash is unviable, like a compilation error")
+    func confirmedCompilerCrashIsUnviable() throws {
+        let record = try verify { ref in
+            MutationObservations(
+                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: nil, activation: nil)),
+                build: BuildObservation(outcome: .failed(kind: .confirmedCompilerCrash, diagnosis: "crashed twice", command: nil))
+            )
+        }
+        #expect(record.outcome == .unviable)
+        guard case .unviable = record.proof else { Issue.record("expected .unviable"); return }
+    }
+
+    @Test("notMaterialized: a no-op canary that passed on a product identical to the baseline's — not scored, not cached")
+    func isolatedPassedUnprovenIsNotMaterialized() throws {
         let record = try verify { ref in
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h0", activation: unprovenIsolated)),
@@ -371,9 +365,64 @@ struct MutationVerdictVerifierTests {
                 test: SingleTestObservation(run: run(status: .passed), applicationEvidence: .isolated(unprovenIsolated))
             )
         }
-        #expect(record.outcome == .infrastructureFailure)
+        #expect(record.outcome == .notMaterialized)
         #expect(!record.outcome.isScorable)
         #expect(!record.outcome.isCacheableResult)
+        #expect(record.outcome.detection == .indeterminate)
+    }
+
+    @Test("notMaterialized: applied edit, successful build, product identical to the baseline's, tests not run")
+    func identicalProductWithoutTestIsNotMaterialized() throws {
+        let record = try verify { ref in
+            MutationObservations(
+                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h0", activation: unprovenIsolated)),
+                build: BuildObservation(outcome: .succeeded(buildProductHash: "h0", command: nil))
+            )
+        }
+        #expect(record.outcome == .notMaterialized)
+        #expect(record.outcome != .infrastructureFailure)
+        #expect(!record.outcome.isScorable)
+        #expect(!record.outcome.isCacheableResult)
+        #expect(!record.outcome.impliesTestWasExecuted)
+        // The proof keeps the application evidence it rests on.
+        #expect(record.proof.evidence?.provesSourceApplication == true)
+        #expect(record.proof.evidence?.applicationEvidence == .isolated(unprovenIsolated))
+    }
+
+    @Test("A claimed identical product that is not the observed one is not credited as notMaterialized")
+    func identicalProductClaimMustMatchObservedBuild() throws {
+        let record = try verify { ref in
+            MutationObservations(
+                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h0", activation: unprovenIsolated)),
+                build: BuildObservation(outcome: .succeeded(buildProductHash: "other", command: nil))
+            )
+        }
+        #expect(record.outcome == .infrastructureFailure)
+    }
+
+    @Test("A product that does differ from the baseline's with no test observation stays an infrastructureFailure")
+    func provenProductWithoutTestIsNotMaterialized() throws {
+        let record = try verify { ref in
+            MutationObservations(
+                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
+                build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil))
+            )
+        }
+        #expect(record.outcome == .infrastructureFailure)
+    }
+
+    @Test("A no-op canary whose suite crashed or failed stays an anomaly, never notMaterialized")
+    func canaryThatBehavedDifferentlyIsNotTrustedAsNotMaterialized() throws {
+        for status in [TestRunStatus.failed, .crashed] {
+            let record = try verify { ref in
+                MutationObservations(
+                    plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h0", activation: unprovenIsolated)),
+                    build: BuildObservation(outcome: .succeeded(buildProductHash: "h0", command: nil)),
+                    test: SingleTestObservation(run: run(status: status), applicationEvidence: .isolated(unprovenIsolated))
+                )
+            }
+            #expect(record.outcome == .infrastructureFailure, "\(status)")
+        }
     }
 
     @Test("survived: passed with proven activation")
@@ -387,136 +436,11 @@ struct MutationVerdictVerifierTests {
         }
         #expect(record.outcome == .survived)
     }
+}
 
-    // MARK: - Confirmation: kill
-
-    @Test("confirmKill: confirmed, exact failing-test-set match")
-    func confirmKillConfirmed() throws {
-        let record = try verify { ref in
-            MutationObservations(
-                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
-                build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed, summary: makeTestSummary(failed: 1)), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(
-                    kind: .kill, run: run(status: .failed, summary: makeTestSummary(failed: 1)),
-                    originalFailingTests: ["ExampleTests/testSomething()"]
-                )]
-            )
-        }
-        #expect(record.outcome == .killedByAssertion)
-    }
-
-    /// `ConfirmationObservation.originalFailingTests` is a caller-supplied
-    /// duplicate of the primary run's own facts and `MutationObservations`
-    /// decodes it as untrusted — a corrupted or hand-edited entry could set
-    /// it to whatever it wants without the primary run agreeing. The
-    /// verifier must compare against the primary run's *own* recorded
-    /// failing-test set, not this field, so a forged value here cannot
-    /// manufacture a confirmed kill.
-    @Test("confirmKill: a forged originalFailingTests field is ignored — the primary run's own summary decides")
-    func confirmKillIgnoresForgedOriginalFailingTests() throws {
-        let primaryFailure = TestOutcomeSummary(total: 4, passed: 3, failed: 1, failingTests: ["RealTests/testReal()"], durationSeconds: nil)
-        let record = try verify { ref in
-            MutationObservations(
-                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
-                build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed, summary: primaryFailure), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(
-                    kind: .kill, run: run(status: .failed, summary: primaryFailure),
-                    // Forged: claims a completely different test than the
-                    // primary run's own summary actually recorded.
-                    originalFailingTests: ["ForgedTests/testForged()"]
-                )]
-            )
-        }
-        #expect(record.outcome == .killedByAssertion)
-    }
-
-    @Test("confirmKill: confirmation's originalFailingTests matches, but the real primary run failed a different test — flaky, not confirmed")
-    func confirmKillRealPrimaryDisagreesWithForgedField() throws {
-        let primaryFailure = TestOutcomeSummary(total: 4, passed: 3, failed: 1, failingTests: ["RealTests/testReal()"], durationSeconds: nil)
-        let confirmingFailure = TestOutcomeSummary(total: 4, passed: 3, failed: 1, failingTests: ["OtherTests/testOther()"], durationSeconds: nil)
-        let record = try verify { ref in
-            MutationObservations(
-                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
-                build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed, summary: primaryFailure), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(
-                    kind: .kill, run: run(status: .failed, summary: confirmingFailure),
-                    // Matches the confirming run's own failing test, but not
-                    // what the primary run actually recorded — must not be
-                    // trusted over the real primary summary.
-                    originalFailingTests: ["OtherTests/testOther()"]
-                )]
-            )
-        }
-        #expect(record.outcome == .flaky)
-    }
-
-    @Test("confirmKill: retest passed instead — flaky")
-    func confirmKillRetestPassed() throws {
-        let record = try verify { ref in
-            MutationObservations(
-                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
-                build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(kind: .kill, run: run(status: .passed), originalFailingTests: ["A"])]
-            )
-        }
-        #expect(record.outcome == .flaky)
-    }
-
-    @Test("confirmKill: retest failed a different test — flaky")
-    func confirmKillDifferentTest() throws {
-        let record = try verify { ref in
-            MutationObservations(
-                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
-                build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(
-                    kind: .kill, run: run(status: .failed, summary: TestOutcomeSummary(total: 4, passed: 3, failed: 1, failingTests: ["B"], durationSeconds: nil)),
-                    originalFailingTests: ["A"]
-                )]
-            )
-        }
-        #expect(record.outcome == .flaky)
-    }
-
-    @Test("confirmKill: no per-test breakdown on either side — flaky, not trusted")
-    func confirmKillNoBreakdown() throws {
-        let record = try verify { ref in
-            MutationObservations(
-                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
-                build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(kind: .kill, run: run(status: .failed), originalFailingTests: nil)]
-            )
-        }
-        #expect(record.outcome == .flaky)
-    }
-
-    @Test("confirmKill: attached to a primary run that was never a kill — rejected, not promoted")
-    func confirmKillOnWrongPrimaryOutcome() throws {
-        // Primary run passed but activation was unproven, so the primary
-        // classification is .infrastructureFailure, not .killedByAssertion.
-        // A hand-edited or corrupted `.kill` confirmation must not be able
-        // to promote that to a kill just by matching the failing-test set.
-        let record = try verify { ref in
-            MutationObservations(
-                plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h0", activation: unprovenIsolated)),
-                build: BuildObservation(outcome: .succeeded(buildProductHash: "h0", command: nil)),
-                test: SingleTestObservation(run: run(status: .passed), applicationEvidence: .isolated(unprovenIsolated)),
-                confirmations: [ConfirmationObservation(
-                    kind: .kill, run: run(status: .failed, summary: makeTestSummary(failed: 1)),
-                    originalFailingTests: ["ExampleTests/testSomething()"]
-                )]
-            )
-        }
-        #expect(record.outcome == .infrastructureFailure)
-        #expect(!record.outcome.isScorable)
-        #expect(!record.outcome.isCacheableResult)
-    }
-
+/// `MutationVerdictVerifierTests`, by decision-table area: crash and timeout confirmation reruns.
+@Suite("Mutation verdict verifier: confirmations")
+struct MutationVerdictVerifierConfirmationTests {
     // MARK: - Confirmation: crash
 
     @Test("confirmCrash: confirmed, identical diagnosis")
@@ -595,7 +519,9 @@ struct MutationVerdictVerifierTests {
     /// still be rejected.
     @Test("confirmTimeout: activation naming hashes that never came from the confirming rebuild's own build is rejected")
     func confirmTimeoutActivationNotTiedToConfirmingBuildIsRejected() throws {
-        let forgedActivation: ActivationEvidence = .buildProductDiffersFromBaseline(mutantHash: "forged-mutant", baselineHash: "forged-baseline")
+        let forgedActivation: ActivationEvidence = .buildProductDiffersFromBaseline(
+            mutantHash: "forged-mutant", baselineHash: "forged-baseline"
+        )
         let record = try verify { ref in
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
@@ -629,7 +555,9 @@ struct MutationVerdictVerifierTests {
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .timedOut, isBatchAttributedTimeout: false), applicationEvidence: .isolated(provenIsolated)),
+                test: SingleTestObservation(
+                    run: run(status: .timedOut, isBatchAttributedTimeout: false), applicationEvidence: .isolated(provenIsolated)
+                ),
                 confirmations: [ConfirmationObservation(
                     kind: .timeout, run: run(status: .failed), activation: provenIsolated, confirmingBuildProductHash: "h1",
                     // Forged: the primary run above was not batch-attributed.
@@ -648,7 +576,10 @@ struct MutationVerdictVerifierTests {
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
                 test: SingleTestObservation(run: run(status: .timedOut), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(kind: .timeout, run: run(status: .timedOut), activation: provenIsolated, confirmingBuildProductHash: "h1")]
+                confirmations: [ConfirmationObservation(
+                    kind: .timeout, run: run(status: .timedOut), activation: provenIsolated,
+                    confirmingBuildProductHash: "h1"
+                )]
             )
         }
         #expect(record.outcome == .verifiedTimeout)
@@ -661,7 +592,10 @@ struct MutationVerdictVerifierTests {
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
                 test: SingleTestObservation(run: run(status: .timedOut), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(kind: .timeout, run: run(status: .timedOut), activation: unprovenIsolated, confirmingBuildProductHash: "h0")]
+                confirmations: [ConfirmationObservation(
+                    kind: .timeout, run: run(status: .timedOut), activation: unprovenIsolated,
+                    confirmingBuildProductHash: "h0"
+                )]
             )
         }
         #expect(record.outcome == .infrastructureFailure)
@@ -687,7 +621,10 @@ struct MutationVerdictVerifierTests {
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
                 test: SingleTestObservation(run: run(status: .timedOut), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(kind: .timeout, run: run(status: .passed), activation: provenIsolated, confirmingBuildProductHash: "h1", wasBatchAttributed: false)]
+                confirmations: [ConfirmationObservation(
+                    kind: .timeout, run: run(status: .passed), activation: provenIsolated,
+                    confirmingBuildProductHash: "h1", wasBatchAttributed: false
+                )]
             )
         }
         #expect(record.outcome == .flaky)
@@ -699,8 +636,13 @@ struct MutationVerdictVerifierTests {
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .timedOut, isBatchAttributedTimeout: true), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(kind: .timeout, run: run(status: .passed), activation: provenIsolated, confirmingBuildProductHash: "h1", wasBatchAttributed: true)]
+                test: SingleTestObservation(
+                    run: run(status: .timedOut, isBatchAttributedTimeout: true), applicationEvidence: .isolated(provenIsolated)
+                ),
+                confirmations: [ConfirmationObservation(
+                    kind: .timeout, run: run(status: .passed), activation: provenIsolated,
+                    confirmingBuildProductHash: "h1", wasBatchAttributed: true
+                )]
             )
         }
         #expect(record.outcome == .survived)
@@ -712,8 +654,15 @@ struct MutationVerdictVerifierTests {
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .timedOut, isBatchAttributedTimeout: true), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(kind: .timeout, run: run(status: .failed), activation: provenIsolated, confirmingBuildProductHash: "h1", wasBatchAttributed: true)]
+                test: SingleTestObservation(
+                    run: run(status: .timedOut, isBatchAttributedTimeout: true),
+                    applicationEvidence: .isolated(provenIsolated),
+                    execution: wholeSuiteExecution
+                ),
+                confirmations: [ConfirmationObservation(
+                    kind: .timeout, run: run(status: .failed), activation: provenIsolated,
+                    confirmingBuildProductHash: "h1", wasBatchAttributed: true
+                )]
             )
         }
         #expect(record.outcome == .killedByAssertion)
@@ -725,13 +674,23 @@ struct MutationVerdictVerifierTests {
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .timedOut, isBatchAttributedTimeout: true), applicationEvidence: .isolated(provenIsolated)),
-                confirmations: [ConfirmationObservation(kind: .timeout, run: run(status: .crashed), activation: provenIsolated, confirmingBuildProductHash: "h1", wasBatchAttributed: true)]
+                test: SingleTestObservation(
+                    run: run(status: .timedOut, isBatchAttributedTimeout: true), applicationEvidence: .isolated(provenIsolated)
+                ),
+                confirmations: [ConfirmationObservation(
+                    kind: .timeout, run: run(status: .crashed), activation: provenIsolated,
+                    confirmingBuildProductHash: "h1", wasBatchAttributed: true
+                )]
             )
         }
         #expect(record.outcome == .killedByCrash)
     }
+}
 
+/// `MutationVerdictVerifierTests`, by decision-table area: caller-supplied confirmation policy and the
+/// verified record's mutationRef.
+@Suite("Mutation verdict verifier: confirmation policy")
+struct MutationVerdictVerifierPolicyTests {
     // MARK: - Confirmation policy
 
     /// `verify(_:)` alone cannot distinguish "this run's own configuration
@@ -746,7 +705,11 @@ struct MutationVerdictVerifierTests {
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed, summary: makeTestSummary(failed: 1)), applicationEvidence: .isolated(provenIsolated))
+                test: SingleTestObservation(
+                    run: run(status: .failed, summary: makeTestSummary(failed: 1)),
+                    applicationEvidence: .isolated(provenIsolated),
+                    execution: wholeSuiteExecution
+                )
             )
         }
         #expect(record.outcome == .infrastructureFailure)
@@ -760,10 +723,14 @@ struct MutationVerdictVerifierTests {
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed, summary: makeTestSummary(failed: 1)), applicationEvidence: .isolated(provenIsolated)),
+                test: SingleTestObservation(
+                    run: run(status: .failed, summary: makeTestSummary(failed: 1)),
+                    applicationEvidence: .isolated(provenIsolated),
+                    execution: wholeSuiteExecution
+                ),
                 confirmations: [ConfirmationObservation(
                     kind: .kill, run: run(status: .failed, summary: makeTestSummary(failed: 1)),
-                    originalFailingTests: ["ExampleTests/testSomething()"]
+                    originalFailingTests: ["ExampleTests/testSomething()"], baselineControl: makePassingBaselineControl()
                 )]
             )
         }
@@ -776,7 +743,11 @@ struct MutationVerdictVerifierTests {
             MutationObservations(
                 plannedMutation: ref, sourceApplication: .applied(makeEvidence(buildProductHash: "h1", activation: provenIsolated)),
                 build: BuildObservation(outcome: .succeeded(buildProductHash: "h1", command: nil)),
-                test: SingleTestObservation(run: run(status: .failed, summary: makeTestSummary(failed: 1)), applicationEvidence: .isolated(provenIsolated))
+                test: SingleTestObservation(
+                    run: run(status: .failed, summary: makeTestSummary(failed: 1)),
+                    applicationEvidence: .isolated(provenIsolated),
+                    execution: wholeSuiteExecution
+                )
             )
         }
         #expect(record.outcome == .killedByAssertion)
@@ -853,3 +824,32 @@ struct MutationVerdictVerifierTests {
         #expect(record.verificationVersion == MutationVerdictVerifier.currentVersion)
     }
 }
+
+// MARK: - Shared helpers
+
+private let verifierTestPlanID = "plan-A"
+private let verifierTestWorkUnitID = "unit-1"
+
+private func ref(for point: MutationPoint) -> PlannedMutationRef {
+    PlannedMutationRef.forPoint(point, planID: verifierTestPlanID, workUnitID: verifierTestWorkUnitID)
+}
+
+private func verify(
+    policy: MutationVerdictVerifier.VerdictVerificationPolicy = .permissive,
+    _ obs: (PlannedMutationRef) -> MutationObservations
+) throws -> VerifiedMutationRecord {
+    let point = try makeAnchoredPoint()
+    return MutationVerdictVerifier.verify(obs(ref(for: point)), policy: policy)
+}
+
+private func run(status: TestRunStatus, summary: TestOutcomeSummary? = nil, isBatchAttributedTimeout: Bool = false) -> TestRunResult {
+    TestRunResult(
+        status: status, summary: summary,
+        command: CommandRecord(executable: "/usr/bin/true", arguments: [], workingDirectory: "/tmp"),
+        resultArtifactPath: nil, diagnosis: "diag:\(status.rawValue)",
+        isBatchAttributedTimeout: isBatchAttributedTimeout
+    )
+}
+
+private var provenIsolated: ActivationEvidence { .buildProductDiffersFromBaseline(mutantHash: "h1", baselineHash: "h0") }
+private var unprovenIsolated: ActivationEvidence { .buildProductIdenticalToBaseline(hash: "h0") }

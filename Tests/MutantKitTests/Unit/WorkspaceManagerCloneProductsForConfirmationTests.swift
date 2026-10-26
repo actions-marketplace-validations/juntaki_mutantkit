@@ -11,8 +11,7 @@ import Testing
 /// retest (`Configuration.execution.retestKilledMutants`) runs `swift test
 /// --skip-build --scratch-path <clone>`, and `--scratch-path` does not
 /// accept a flat products directory — confirmed empirically against a real
-/// toolchain (see this project's internal product-completeness
-/// freeze-release-gate research, not part of this public repo) — it computes its own triple/
+/// toolchain) — it computes its own triple/
 /// configuration internally and looks for pre-built products nested under
 /// exactly that shape beneath whatever `--scratch-path` it is given.
 @Suite("WorkspaceManager: cloneProductsForConfirmation")
@@ -105,7 +104,7 @@ struct WorkspaceManagerCloneProductsForConfirmationTests {
         let products = try makeFakeProductsDirectory()
 
         let first = try await workspaces.cloneProductsForConfirmation(from: products, id: "mut_a")
-        try await workspaces.destroySandbox(at: first)
+        try await workspaces.destroyProductsClone(at: first)
         let firstAgain = try await workspaces.cloneProductsForConfirmation(from: products, id: "mut_a")
         let second = try await workspaces.cloneProductsForConfirmation(from: products, id: "mut_b")
 
@@ -138,14 +137,14 @@ struct WorkspaceManagerCloneProductsForConfirmationTests {
         #expect(try Data(contentsOf: binary) == Data("second-mutant".utf8))
     }
 
-    @Test("destroySandbox deletes a nested confirmation clone unmodified, same as a sandbox")
-    func destroySandboxDeletesAClone() async throws {
+    @Test("destroyProductsClone deletes a nested confirmation clone unmodified")
+    func destroyProductsCloneDeletesAClone() async throws {
         let workspaces = try WorkspaceManager(projectRoot: projectRoot, scratchRoot: scratchRoot)
         let products = try makeFakeProductsDirectory()
         let destination = try await workspaces.cloneProductsForConfirmation(from: products, id: "mut_a")
         #expect(FileManager.default.fileExists(atPath: destination.path))
 
-        try await workspaces.destroySandbox(at: destination)
+        try await workspaces.destroyProductsClone(at: destination)
 
         #expect(!FileManager.default.fileExists(atPath: destination.path))
     }
@@ -166,5 +165,31 @@ struct WorkspaceManagerCloneProductsForConfirmationTests {
 
         let nestedBinary = destination.appendingPathComponent("arm64-apple-macosx/debug/Fake.xctest/Fake")
         #expect(FileManager.default.fileExists(atPath: nestedBinary.path))
+    }
+
+    /// Swift 6.4 builds into `.build/out/Products/Debug` (no `<triple>/<config>`
+    /// level) and still exposes `.build/debug` as a symlink to it. The nested
+    /// clone must keep the layout SwiftPM itself will look for.
+    @Test("A products directory symlinked to `out/Products/Debug` keeps that layout in the clone")
+    func clonesTheOutProductsLayoutVerbatim() async throws {
+        let workspaces = try WorkspaceManager(projectRoot: projectRoot, scratchRoot: scratchRoot)
+
+        let buildDir = projectRoot.appendingPathComponent(".build-\(UUID().uuidString)")
+        let realProducts = buildDir.appendingPathComponent("out/Products/Debug")
+        let bundle = realProducts.appendingPathComponent("Fake.xctest")
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        try Data("binary-bytes".utf8).write(to: bundle.appendingPathComponent("Fake"))
+        let debugSymlink = buildDir.appendingPathComponent("debug")
+        try FileManager.default.createSymbolicLink(
+            atPath: debugSymlink.path, withDestinationPath: "out/Products/Debug"
+        )
+
+        let destination = try await workspaces.cloneProductsForConfirmation(from: debugSymlink, id: "mut_out")
+
+        let nested = destination.appendingPathComponent("out/Products/Debug/Fake.xctest/Fake")
+        #expect(try Data(contentsOf: nested) == Data("binary-bytes".utf8))
+        #expect(!FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("Products/Debug").path
+        ))
     }
 }

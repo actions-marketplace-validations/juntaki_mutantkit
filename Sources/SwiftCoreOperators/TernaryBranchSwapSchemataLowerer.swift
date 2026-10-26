@@ -25,7 +25,7 @@ import SwiftSyntax
 /// evaluates at runtime.
 public struct TernaryBranchSwapSchemataLowerer: SchemataLowerer {
     public static let lowererID = "swift.core.ternary-branch-swap.schemata"
-    public static let lowererVersion = 1
+    public static let lowererVersion = 3
     public static let runtimeABIVersion = BoolLiteralSchemataLowerer.runtimeABIVersion
 
     public let descriptor = SchemataLowererDescriptor(
@@ -100,6 +100,10 @@ public struct TernaryBranchSwapSchemataLowerer: SchemataLowerer {
             if let reason = Self.unsafetyReason(for: nested.thenExpression) { return reason }
             return Self.unsafetyReason(for: nested.elseExpression)
         }
+        if ComposedBooleanOperand.isComposed(unwrapped) {
+            return ComposedBooleanOperand.unsafetyReason(for: unwrapped, recurse: Self.unsafetyReason(for:))
+        }
+        if ComposedBooleanOperand.isAcceptedCall(unwrapped) { return nil }
         return Self.unsafeOperandReason(for: unwrapped)
     }
 

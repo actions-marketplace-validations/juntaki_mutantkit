@@ -35,7 +35,7 @@ drift apart; update both together.
 | `swiftPackageMacOS` | XCTest + Swift Testing, mixed in one bundle | host (macOS) | **Supported** | `SchemataSupportedMatrixSwiftPMMacOSAcceptanceTests.mixedFrameworksFullyActivate` |
 | `xcodeProject` | XCTest | iOS Simulator | **Supported** | `SchemataMatrixIOSSimulatorAcceptanceTests.fullyActivatesNoFallback` + `startupHitAndReceiptUUIDMatchOnIOSSimulator` (override) + `ReleaseBundledSchemataXcodeIOSSimulatorAcceptanceTests.xcodeProjectSchemataRunSucceedsFromBundledRuntimeAlone` (bundled release runtime, no override) |
 | `swiftPackageApple` (SwiftPM package for a non-host Apple platform) | XCTest | iOS Simulator | **Unsupported** | `SchemataSupportedMatrixSwiftPackageAppleAcceptanceTests` — pinned, see below |
-| `xcodeWorkspace` | XCTest | iOS Simulator | **Unsupported** | `SchemataSupportedMatrixXcodeWorkspaceAcceptanceTests` — pinned, see below |
+| `xcodeWorkspace` | XCTest | iOS Simulator | **Supported** | `SchemataSupportedMatrixXcodeWorkspaceAcceptanceTests.requestingSchemataExecutesAndOnlyUncoveredMutationsFallBack` |
 
 Swift Testing vs. XCTest is not tested separately for `xcodeProject`: schemata
 activation and evidence collection read the same `.xctestrun`-driven test
@@ -54,6 +54,23 @@ these platforms/destinations — that is a separate question this matrix does
 not answer, and no claim about it should be inferred from schemata's own
 scope here.
 
+## SwiftPM packages with more than one test target on Xcode 27
+
+With Xcode 27 (Swift 6.4), `swift build --build-tests` links each test target
+into its own bundle (`<Target>.xctest`) instead of one combined
+`<Package>PackageTests.xctest`, and a package's library code is statically
+linked into every one of them. The build receipt names every image that holds a
+unit's code (one per dependent test target, plus any executable or dynamic
+library product that links it), so a package with two or more test targets runs
+on the shared schemata build like a single-target one. A dependent test target
+whose image cannot be found by its exact name still fails closed for that
+target, reported in `fallbackReasonCounts["buildReceiptUnavailable"]`.
+
+Proof: `SchemataMultiTestTargetAcceptanceTests` runs
+`Fixtures/DisjointTestTargets` (two libraries, each tested by its own target)
+with `execution.strategy: schemata` and requires mutations to run on the shared
+build with no `buildReceiptUnavailable` fallback.
+
 ## Why the two unsupported rows are unsupported
 
 **`swiftPackageApple` + iOS Simulator.** This project kind resolves its
@@ -68,17 +85,18 @@ buildSettings entry named <name>, found 0
 ```
 
 Every mutation forfeits schemata and re-runs isolated
-(`fallbackReasonCounts["buildReceiptUnavailable"]`, P2's own fail-closed
+(`fallbackReasonCounts["buildReceiptUnavailable"]`, the fail-closed
 fallback) — the report is still fully correct, just never actually
 schemata. Fixing the receipt resolver for this hybrid pairing is real
 production work, out of scope for the phase that measured this matrix.
 
-**`xcodeWorkspace`.** `SchemataRunOrchestration.swift`'s own target-resolution
-switch has no case for `.xcodeWorkspace` at all — it prints "Schemata target
-resolution is not yet implemented for xcodeWorkspace; every mutation will
-run in isolated mode this run" and returns before any chunk is planned. This
-is a whole-run degradation (`executionStrategy.degradationReason` is set),
-not per-mutation fallback.
+**`xcodeWorkspace`** was unsupported until schemata build receipt v3: the target-resolution switch had no
+case for it, so every run degraded to isolated. It now reads the workspace's member
+`.xcodeproj` files from `contents.xcworkspacedata`, resolves each like a lone project and
+re-roots source paths at the workspace directory; a member that cannot be resolved is skipped
+with a warning and its files run isolated. A scheme with an empty Build action (a test-only
+scheme) is handled by reading the scheme's dependency targets from their own project.
+Also exercised on macOS (native destination) against RxSwift's `Rx.xcworkspace`.
 
 ## Fallback is not failure
 
@@ -117,6 +135,7 @@ run:
 | `unary-not-removal` | `UnaryNotSchemataIsolatedDifferentialAcceptanceTests` |
 | `return-value-replacement` | `ReturnValueSchemataIsolatedDifferentialAcceptanceTests` |
 | `ternary-branch-swap` | `TernaryBranchSwapSchemataIsolatedDifferentialAcceptanceTests` |
+| `nil-coalescing-fallback` (`stronger`, not default) | `NilCoalescingFallbackDifferentialTests` (compiles the lowered text with `swiftc` and compares result and evaluation trace with the isolated mutant) |
 
 All six show 100% verdict parity between backends today. `ArithmeticOperatorReplacementOperator`
 is schemata-ineligible (no registered lowerer) and always runs isolated,
@@ -133,3 +152,16 @@ source checkout, or testing a runtime change before it's released) — an
 ordinary user never needs to set it. See `SchemataRuntimeLibraryLocator`'s
 own doc comment for the exact resolution order (override always wins over
 the bundled path).
+
+## Checking the schemata runtime before a run
+
+`mutantkit doctor` reports a `Schemata runtime` item (`code: schemataRuntime`): whether the
+runtime archive a schemata build links against can be found and trusted, per platform.
+
+- A bundled runtime (a released install) is reported as verified: manifest, SHA-256 digest and
+  runtime ABI version are checked.
+- A developer override (`MUTANTKIT_SCHEMATA_RUNTIME_LIB_OVERRIDE`) is reported as an override,
+  with a warning. Only the file's presence and source staleness are checked.
+- Without either, the item is a warning, because isolated execution does not need the runtime.
+  `doctor --require-schemata-runtime` makes it a failure, for qualification runs. Without a
+  runtime every schemata chunk build fails and mutants report `infrastructureFailure`.

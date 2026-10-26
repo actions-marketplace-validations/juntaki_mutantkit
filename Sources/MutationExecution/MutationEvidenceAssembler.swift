@@ -6,39 +6,43 @@ import SwiftFrontend
 /// structures a `MutationResult` carries, and — through `finalize` — is the
 /// single path from those observations to a reportable result.
 ///
-/// Extracted out of `MutationRunner` (Phase A1 of the execution-pipeline
-/// decomposition): every stored property here is one of `MutationRunner`'s
+/// Extracted out of `MutationRunner`: every stored property here is one of `MutationRunner`'s
 /// own dependencies for exactly this job — `plan` for the `planID`/
-/// `workUnitID` a result is stamped with, `configuration` for the
-/// confirmation policy `MutationVerdictVerifier` is judged against,
+/// `workUnitID` a result is stamped with, `policy` for the confirmation
+/// policy `MutationVerdictVerifier` is judged against,
 /// `checkpoints`/`resultCache`/`progress`/`operationalIssues` for
 /// `finalize`'s own persistence side effects. `operationalIssues` in
 /// particular is the *same* `OperationalIssueLog` instance
 /// `MutationRunner` itself holds and reads at the end of `run()` — passed
 /// in at construction, not created here — so a warning `finalize` records
 /// still reaches that run's own `RunReport.operationalIssues`.
+///
+/// Extraction-plan Step 9: `policy` replaces what used to be a whole
+/// `configuration: Configuration` field held only so `verificationPolicy`
+/// (below) could recompute `MutationVerdictVerifier.VerdictVerificationPolicy`
+/// from it on every access — `configuration` was never read for anything
+/// else here. `policy` is now supplied once, already computed by the Step 1
+/// factory (the same value `RunSession.policy`/`MutationRunner`'s own local
+/// carry), so this is a pure narrowing plus removing a redundant
+/// recomputation, not a behavior change: the three
+/// `Configuration.execution` booleans this ends up gated on are bit-for-bit
+/// identical to what `verificationPolicy` used to compute fresh each time.
 struct MutationEvidenceAssembler: Sendable {
     let plan: MutationPlan
-    let configuration: Configuration
+    let policy: MutationVerdictVerifier.VerdictVerificationPolicy
     let checkpoints: CheckpointStore?
     let artifactsRoot: URL?
     let resultCache: MutationResultCache?
     let resultCacheDigest: String?
-    let progress: ProgressReporter?
+    let progress: MutationModel.ProgressReporter?
     let operationalIssues: OperationalIssueLog
-
-    /// The confirmation policy this run is actually gated on — passed to
-    /// `MutationVerdictVerifier.verify` so it can require the confirmation
-    /// `finishAfterTest`'s own `configuration.execution.retestKilledMutants`/
-    /// `confirmCrashKills` checks promise, rather than trusting whatever
-    /// `confirmations` a reverified `MutationObservations` happens to carry.
-    private var verificationPolicy: MutationVerdictVerifier.VerdictVerificationPolicy {
-        MutationVerdictVerifier.VerdictVerificationPolicy(
-            retestKilledMutants: configuration.execution.retestKilledMutants,
-            confirmCrashKills: configuration.execution.confirmCrashKills,
-            confirmTimedOutMutants: configuration.execution.confirmTimedOutMutants
-        )
-    }
+    /// Opt-in: when set, every finalized mutant's raw observations are also
+    /// written to the run's evidence archive (see `archiveEvidence`).
+    var evidenceArchive: EvidenceArchiveWriter?
+    /// When termination has been forced, a mutant cut short mid-build is not
+    /// persisted anywhere: it must be re-run on resume, not remembered as an
+    /// infrastructure failure the interruption itself caused.
+    var stop: RunStopRequest?
 
     /// Whether the mutation reached the binary the tests ran against.
     ///
@@ -53,14 +57,14 @@ struct MutationEvidenceAssembler: Sendable {
             : .buildProductDiffersFromBaseline(mutantHash: mutantHash, baselineHash: baselineHash)
     }
 
-    /// ADR-0006 Stage 1: the single path from raw observations to a
+    /// The authoritative verdict pipeline: the single path from raw observations to a
     /// reportable result — `MutationObservations -> MutationVerdictVerifier
     /// -> MutationResult` projection. There is no other way for this file
     /// to produce a `MutationResult`: `prepare`'s `finished` closure,
     /// `finishAfterTest`, and every pre-classification infrastructure-
     /// failure early exit (sandbox creation, a build/test launch failure)
     /// all route through here — including the early exits, which PR B
-    /// (ADR-0005) deliberately left outside the verifier because there was
+    /// (the authoritative verdict pipeline) deliberately left outside the verifier because there was
     /// "no classification decision to sit in front of." That reasoning
     /// under-weighted the actual goal: the point was never "re-check a
     /// classifier's judgment," it is "nothing constructs a `MutationResult`
@@ -77,7 +81,7 @@ struct MutationEvidenceAssembler: Sendable {
     /// reportable result — every result-producing path in this file ends
     /// here, directly or through `finishAfterTest`/`infrastructureFailureResult`.
     ///
-    /// ADR-0006 Stage 1 (second review round): persistence now happens
+    /// The authoritative verdict pipeline (second review round): persistence now happens
     /// *here*, not at each of this function's ~20 call sites. Previously
     /// every call site did its own `checkpoints?.record(result)` right
     /// after obtaining `result` — one call per finalized mutant, but
@@ -112,7 +116,7 @@ struct MutationEvidenceAssembler: Sendable {
             confirmations: confirmations,
             infrastructureFailureDiagnosis: infrastructureFailureDiagnosis
         )
-        let record = MutationVerdictVerifier.verify(observations, policy: verificationPolicy)
+        let record = MutationVerdictVerifier.verify(observations, policy: policy)
         let result: MutationResult
         do {
             result = try MutationResult.projected(
@@ -129,6 +133,11 @@ struct MutationEvidenceAssembler: Sendable {
             // honest infrastructure failure if some future change ever did
             // make this reachable.
             preconditionFailure("finalize's own ref must always match projected's recomputation: \(error)")
+        }
+
+        if stop?.isForced == true {
+            stop?.markDiscarded(point.id)
+            return result
         }
 
         do {
@@ -150,6 +159,7 @@ struct MutationEvidenceAssembler: Sendable {
                 OperationalIssue(severity: .warning, kind: .checkpointWriteFailed, mutationID: point.id, diagnosis: diagnosis)
             )
         }
+        await archiveEvidence(observations, mutationID: point.id)
         if let resultCache, let resultCacheDigest {
             await resultCache.store(
                 observations, durationSeconds: durationSeconds, buildDurationSeconds: buildDurationSeconds,
@@ -157,7 +167,7 @@ struct MutationEvidenceAssembler: Sendable {
                 for: MutationResultCache.Key(mutationID: point.id, contextDigest: resultCacheDigest)
             )
         }
-        await progress?.recordCompletion()
+        await progress?.recordCompletion(outcome: result.outcome)
         return result
     }
 

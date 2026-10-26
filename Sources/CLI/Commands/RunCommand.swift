@@ -37,6 +37,15 @@ struct RunCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Exit non-zero if any mutant survives.")
     var failOnSurvivors = false
 
+    @Flag(name: .long, help: ArgumentHelp(
+        "Qualification run: exit non-zero (6) unless schemata mode actually executed. "
+            + "Without this, a schemata run that fell back to isolated still exits 0."
+    ))
+    var requireSchemata = false
+
+    @Option(name: .long, help: "With --require-schemata: how many mutations may fall back to isolated execution before the run is invalid.")
+    var maxUnexpectedFallbacks = 0
+
     @Flag(name: .long, help: "Ignore any checkpoint and re-run every mutant.")
     var noResume = false
 
@@ -71,10 +80,9 @@ struct RunCommand: AsyncParsableCommand {
         }
         let loadedPlan = try MutationPlan.decode(from: Data(contentsOf: planURL))
 
-        var resolution = try await AppleAdapterFactory.resolve(configuration: settings, in: root)
-        print("Project: \(resolution.detection.kind.rawValue) — \(resolution.detection.reason)")
-
         let runDirectory = root.appendingPathComponent(".mutantkit")
+
+        var resolution = try await Self.resolveAdapterAndLayout(settings: settings, root: root, runDirectory: runDirectory)
 
         // The configuration exactly as loaded/overridden, before
         // `ExecutionProfileSupport.resolveProfile` (below) may turn
@@ -226,6 +234,22 @@ struct RunCommand: AsyncParsableCommand {
         }
     }
 
+    /// The adapter, rebuilt for the run's sandbox layout: laid out once,
+    /// here, and handed to every sandbox of the run, it is the project plus
+    /// every local package outside it that the build reads.
+    private static func resolveAdapterAndLayout(
+        settings: Configuration, root: URL, runDirectory: URL
+    ) async throws -> AppleAdapterFactory.Resolution {
+        let manifestDumps = SwiftPMManifestDumps()
+        let resolution = try await LocalPackageLayout.resolve(
+            AppleAdapterFactory.resolve(configuration: settings, in: root, manifestDumps: manifestDumps),
+            configuration: settings, projectRoot: root,
+            scratchRoot: runDirectory.appendingPathComponent("sandboxes"), manifestDumps: manifestDumps
+        )
+        print("Project: \(resolution.detection.kind.rawValue) — \(resolution.detection.reason)")
+        return resolution
+    }
+
     /// v0.5 Stable Contracts: diagnostics go to stderr, not stdout — both
     /// lines here are the failure report itself (why the simulator was not
     /// ready, and the consequence of failing closed), not separate success
@@ -253,7 +277,8 @@ struct RunCommand: AsyncParsableCommand {
     /// exactly as it did before the extraction.
     /// Bundles `runAfterSimulatorPoolProvisioned`'s inputs into one value so
     /// the function stays within this project's `function_parameter_count`
-    /// limit — the same motive as `ManifestWriteContext`/`IsolatedRunOptions`
+    /// limit — the same motive as `ManifestWriteContext`/
+    /// `HybridExecutionEngine.IsolatedRunOptions`
     /// elsewhere in this command. Declared here, next to its only caller
     /// and callee, rather than in `RunCommand+ExecutionContext.swift` with
     /// the other bundles: those group a callee's own needs, this one groups
@@ -298,13 +323,16 @@ struct RunCommand: AsyncParsableCommand {
         let coverageCacheKey = executionContext.coverageCacheKey
         let resultCache = executionContext.resultCache
         let resultCacheDigest = executionContext.resultCacheDigest
+        let evidenceArchive = executionContext.evidenceArchive
 
         // Deliberately not `sources.exclude`: that governs which files are
         // *mutated*, not which files a sandbox needs to build. Copying build
         // state is actively harmful — SwiftPM records absolute paths in `.build`,
         // so a copy of it at a new path fails before it compiles anything.
-        let workspaces = try WorkspaceManager(
-            projectRoot: root, scratchRoot: scratch, cleanSubtreeCloning: settings.resolved.execution.cleanSubtreeCloning
+        let workspaces = try LocalPackageLayout.workspaceManager(
+            layout: resolution.sandboxLayout ?? .projectOnly(root), kind: resolution.detection.kind,
+            projectPath: settings.resolved.project.path,
+            scratchRoot: scratch, cleanSubtreeCloning: settings.resolved.execution.cleanSubtreeCloning
         )
         if await workspaces.supportsAPFSClone() {
             print("Sandboxes: APFS clone (copy-on-write)")
@@ -328,31 +356,41 @@ struct RunCommand: AsyncParsableCommand {
         )
         writeManifest(plan: loadedPlan, context: manifestContext, baselineDuration: 0, to: manifestURL)
 
-        let report = try await Self.execute(
-            strategy: settings.resolved.execution.strategy,
-            context: SchemataRunOrchestration.Context(
-                plan: loadedPlan, configuration: settings.resolved, projectRoot: root,
-                adapter: resolution.adapter, testAdapter: testAdapter, toolchain: toolchain,
-                // Deliberately the same two values passed to
-                // `IsolatedRunOptions` below, not a second cache instance or
-                // a second digest computation: whichever backend measures
-                // the attribution first, the other one reuses it.
-                coverageCache: coverageCache, coverageCacheKey: coverageCacheKey
-            ),
-            workspaces: workspaces, runDirectory: runDirectory,
-            isolatedOptions: IsolatedRunOptions(
-                checkpoints: checkpoints, artifactsRoot: artifacts, coverageCache: coverageCache, coverageCacheKey: coverageCacheKey,
-                resultCache: resultCache, resultCacheDigest: resultCacheDigest, priorityStore: runnerPriorityStore,
-                // Labelled, and only ever handed to the `.isolated` branch of
-                // `execute` below, where the whole plan really is what this
-                // one runner will work through. A schemata run's own
-                // isolated-fallback portion gets a separate reporter totalled
-                // on the *fallback* plan (see `runFallbackPortion`) — this
-                // total would stall short of completion there, since most of
-                // the plan never reaches that portion.
-                progress: ProgressReporter(total: loadedPlan.mutations.count, label: "mutants")
-            )
+        // Only the isolated backend checkpoints per mutant, so only it can stop
+        // gracefully; other strategies keep the default signal behaviour.
+        let strategy = settings.resolved.execution.strategy
+        let stop = strategy == .isolated ? RunStopRequest() : nil
+        let progress = ProgressReporter(total: loadedPlan.mutations.count, label: "mutants")
+        let engineContext = HybridExecutionEngine.Context(
+            plan: loadedPlan, configuration: settings.resolved, projectRoot: root,
+            adapter: resolution.adapter, testAdapter: testAdapter, toolchain: toolchain,
+            // Deliberately the same two values passed to
+            // `HybridExecutionEngine.IsolatedRunOptions` below, not a
+            // second cache instance or a second digest computation:
+            // whichever backend measures the attribution first, the
+            // other one reuses it.
+            coverageCache: coverageCache, coverageCacheKey: coverageCacheKey, evidenceArchive: evidenceArchive
         )
+        let isolatedOptions = HybridExecutionEngine.IsolatedRunOptions(
+            checkpoints: checkpoints, artifactsRoot: artifacts, coverageCache: coverageCache, coverageCacheKey: coverageCacheKey,
+            resultCache: resultCache, resultCacheDigest: resultCacheDigest, priorityStore: runnerPriorityStore,
+            // Labelled, and only ever handed to the `.isolated` branch of
+            // `execute` below, where the whole plan really is what this
+            // one runner will work through. A schemata run's own
+            // isolated-fallback portion gets a separate reporter totalled
+            // on the *fallback* plan (see `runFallbackPortion`) — this
+            // total would stall short of completion there, since most of
+            // the plan never reaches that portion.
+            progress: progress, evidenceArchive: evidenceArchive, stop: stop
+        )
+        let executed = try await Self.withInterruptHandling(stop: stop) {
+            try await Self.execute(
+                strategy: strategy, context: engineContext, workspaces: workspaces,
+                runDirectory: runDirectory, isolatedOptions: isolatedOptions
+            )
+        }
+        await progress.finish()
+        let report = Self.sealEvidenceArchive(evidenceArchive, in: executed, keep: settings.resolved.evidence?.keep)
 
         // Rewritten with the *measured* baseline-adaptive timeout once the
         // baseline has actually run — the pre-run write above used
@@ -363,14 +401,35 @@ struct RunCommand: AsyncParsableCommand {
             writeManifest(plan: loadedPlan, context: manifestContext, baselineDuration: report.baseline.durationSeconds, to: manifestURL)
         }
 
-        try emit(report, settings: settings.resolved, runDirectory: runDirectory)
-        // Gate 3 diagnostic instrumentation only (see
+        try await concludeRun(
+            report, stop: stop, checkpointURL: checkpoints.fileURL, settings: settings.resolved, runDirectory: runDirectory
+        )
+    }
+
+    /// What follows a finished (or interrupted) execution: the interruption exit, the reports, the optional
+    /// timing file, the history entry, and the integrity, qualification and survivor exits.
+    private func concludeRun(
+        _ report: RunReport, stop: RunStopRequest?, checkpointURL: URL, settings: Configuration, runDirectory: URL
+    ) async throws {
+        // An interrupted run: write what exists (a report marked partial when
+        // any mutant has a result), say how to resume, and exit with a code of
+        // its own. No history entry — a partial run is not a data point.
+        if let summary = Self.interruptionSummary(
+            report: report, stop: stop, checkpointURL: checkpointURL, arguments: CommandLine.arguments
+        ) {
+            if report.interruption != nil { try emit(report, settings: settings, runDirectory: runDirectory) }
+            print(summary)
+            throw ExitCode(MutantKitExit.interrupted)
+        }
+
+        try emit(report, settings: settings, runDirectory: runDirectory)
+        // Diagnostic timing instrumentation only (see
         // `GateTimingRecorder`'s own doc comment) — every other run leaves
         // this env var unset and pays nothing beyond the spans' already-
         // negligible recording cost.
         if let timingOutputPath = ProcessInfo.processInfo.environment["MUTANTKIT_GATE3_TIMING_OUTPUT"] {
             try await GateTimingRecorder.shared.write(to: URL(fileURLWithPath: timingOutputPath))
-            print("Wrote \(timingOutputPath) (Gate 3 timing spans)")
+            print("Wrote \(timingOutputPath) (timing spans)")
         }
         if !noHistory {
             Self.recordHistory(report, to: RunHistoryStore(root: runDirectory.appendingPathComponent("history")))
@@ -382,59 +441,96 @@ struct RunCommand: AsyncParsableCommand {
         guard report.integrity.passed else {
             throw ExitCode(MutantKitExit.integrityFailure)
         }
+        try enforceSchemataQualification(report)
         if failOnSurvivors, (report.score?.survived ?? 0) > 0 {
             throw ExitCode(MutantKitExit.survivorsFound)
         }
     }
 
-    /// Dispatches to the existing, unmodified `MutationRunner` for
-    /// `.isolated` or to `SchemataRunOrchestration` for `.schemata` —
-    /// pulled out of `run()` itself so that already-large function's own
-    /// complexity does not keep growing every time a new execution
-    /// strategy is added.
+    private func enforceSchemataQualification(_ report: RunReport) throws {
+        guard requireSchemata else { return }
+        let problems = SchemataQualification(maximumUnexpectedFallbacks: maxUnexpectedFallbacks).violations(in: report)
+        if !problems.isEmpty {
+            FileHandle.standardError.write(Data((
+                "error: --require-schemata: this run is not a valid schemata measurement:\n"
+                    + problems.map { "  - \($0)\n" }.joined()
+            ).utf8))
+            throw ExitCode(MutantKitExit.qualificationFailed)
+        }
+    }
+
+    /// Dispatches to `HybridExecutionEngine.runIsolated` for `.isolated` or
+    /// `.runHybrid` for `.schemata` — pulled out of `run()` itself so that
+    /// already-large function's own complexity does not keep growing every
+    /// time a new execution strategy is added. Plan §3 Step 6's own two-case
+    /// dispatch: the *only* residual CLI-side logic is the one line
+    /// `classify(context)` that §0's module boundary makes unavoidable — CLI
+    /// decides *that* a `.schemata` run needs a classification computed
+    /// before the engine can run, because only CLI can reach the code that
+    /// computes one (`SwiftPMTargetResolver`/`XcodeTargetResolver` in
+    /// `AppleBuildAdapters`, `SchemataChunkPlanner`/`SchemataLowererRegistry`
+    /// in `MutationPlanner`, both structurally unreachable from
+    /// `MutationExecution` without a new, avoidable dependency edge); it
+    /// does not decide *how* the two
+    /// backends are sequenced, merged, or how a dynamic fallback is detected
+    /// — that is 100% `HybridExecutionEngine` now.
     private static func execute(
-        strategy: ExecutionMode, context: SchemataRunOrchestration.Context, workspaces: WorkspaceManager,
-        runDirectory: URL, isolatedOptions: IsolatedRunOptions
+        strategy: ExecutionMode, context: HybridExecutionEngine.Context, workspaces: WorkspaceManager,
+        runDirectory: URL, isolatedOptions: HybridExecutionEngine.IsolatedRunOptions
     ) async throws -> RunReport {
         switch strategy {
         case .isolated:
-            return try await MutationRunner(
-                plan: context.plan,
-                configuration: context.configuration,
-                projectRoot: context.projectRoot,
-                build: context.adapter.build,
-                test: context.testAdapter,
-                workspaces: workspaces,
-                checkpoints: isolatedOptions.checkpoints,
-                artifactsRoot: isolatedOptions.artifactsRoot,
-                toolchain: context.toolchain,
-                coverageCache: isolatedOptions.coverageCache,
-                coverageCacheKey: isolatedOptions.coverageCacheKey,
-                resultCache: isolatedOptions.resultCache,
-                resultCacheDigest: isolatedOptions.resultCacheDigest,
-                priorityStore: isolatedOptions.priorityStore,
-                progress: isolatedOptions.progress
-            ).run()
+            return try await HybridExecutionEngine.runIsolated(context: context, workspaces: workspaces, options: isolatedOptions)
         case .schemata:
+            // Checked here, before `classify(_:)` runs, matching
+            // `SchemataRunOrchestration.run`'s own former order exactly —
+            // `classify(_:)` does real work (target resolution, source
+            // reads, chunk planning, its own diagnostic `print()`s on a
+            // partial-failure branch), none of which should happen on an
+            // adapter that cannot run schemata at all. `HybridExecutionEngine
+            // .runHybrid` re-checks the same fact for its own internal use
+            // of the bound `SchemataBuildable`/`SchemataTestable` values —
+            // see that function's own doc comment.
+            guard context.adapter.schemataBuild != nil, context.testAdapter is SchemataTestable else {
+                throw HybridExecutionEngine.EngineError.adapterNotSchemataCapable
+            }
+            // Must be captured here, before `classify(_:)` runs — moving it
+            // into `runHybrid` would start every schemata run's reported
+            // wall-clock time (`RunReport.startedAt`, and everything
+            // `PerformanceSummary`/`RunHistory` derive from it) after
+            // `classify(_:)`'s own real work instead of before it.
+            let startedAt = Date()
             // A separate scratch subdirectory from the isolated-fallback
             // pass's `workspaces` so the two passes' sandboxes never
             // collide mid-run.
             let schemataScratch = runDirectory.appendingPathComponent("schemata-sandboxes")
-            let schemataWorkspaces = try WorkspaceManager(
-                projectRoot: context.projectRoot,
+            let schemataWorkspaces = try LocalPackageLayout.workspaceManager(
+                layout: workspaces.layout,
+                kind: context.adapter.kind,
+                projectPath: context.configuration.project.path,
                 scratchRoot: schemataScratch,
                 cleanSubtreeCloning: context.configuration.execution.cleanSubtreeCloning
             )
-            // No timeout argument: this call site used to pass
-            // `timeouts.baselineSeconds` as the *only* limit, which
-            // `SchemataMutationRunner` then applied to every per-mutant token
-            // run as well as to the baseline — giving a hanging schemata
-            // mutant the whole suite's budget (600 s by default) where
-            // isolated mode correctly spends `timeouts.mutant`. The runner
-            // now reads `context.configuration.timeouts` itself and resolves
-            // each limit separately.
-            return try await SchemataRunOrchestration.run(
-                context: context, workspaces: workspaces, schemataWorkspaces: schemataWorkspaces
+            // Same "classify" timing span `SchemataRunOrchestration
+            // .run`'s own former wrapper body used to wrap this call in
+            // directly — preserved here, around the one place `classify(_:)`
+            // is still actually called, rather than left inside `runHybrid`
+            // where it would measure nothing (see `HybridExecutionEngine
+            // .runHybrid`'s own doc comment on this split). No timeout
+            // argument: this call site used to pass `timeouts.baselineSeconds`
+            // as the *only* limit, which `SchemataMutationRunner` then applied
+            // to every per-mutant token run as well as to the baseline —
+            // giving a hanging schemata mutant the whole suite's budget
+            // (600 s by default) where isolated mode correctly spends
+            // `timeouts.mutant`. The runner now reads
+            // `context.configuration.timeouts` itself and resolves each
+            // limit separately.
+            let classifyStart = GateTimingRecorder.shared.now()
+            let classification = try await SchemataRunOrchestration.classify(context)
+            await GateTimingRecorder.shared.record("classify", start: classifyStart)
+            return try await HybridExecutionEngine.runHybrid(
+                context: context, classification: classification, workspaces: workspaces,
+                schemataWorkspaces: schemataWorkspaces, startedAt: startedAt
             )
         }
     }

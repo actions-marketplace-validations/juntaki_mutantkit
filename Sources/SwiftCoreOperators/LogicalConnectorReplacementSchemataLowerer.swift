@@ -49,7 +49,7 @@ public struct LogicalConnectorMutationVariant: Codable, Hashable, Sendable {
 /// function-call operand does today.
 public struct LogicalConnectorReplacementSchemataLowerer: SchemataLowerer {
     public static let lowererID = "swift.core.logical-connector-replacement.schemata"
-    public static let lowererVersion = 1
+    public static let lowererVersion = 3
     /// Same v3 runtime protocol every other lowerer uses — one shared
     /// runtime, not a second one invented per operator.
     public static let runtimeABIVersion = BoolLiteralSchemataLowerer.runtimeABIVersion
@@ -132,6 +132,10 @@ public struct LogicalConnectorReplacementSchemataLowerer: SchemataLowerer {
             guard let base = member.base else { return nil }
             return Self.unsafetyReason(for: base)
         }
+        if ComposedBooleanOperand.isComposed(unwrapped) {
+            return ComposedBooleanOperand.unsafetyReason(for: unwrapped, recurse: Self.unsafetyReason(for:))
+        }
+        if ComposedBooleanOperand.isAcceptedCall(unwrapped) { return nil }
         return Self.unsafeOperandReason(for: unwrapped)
     }
 
@@ -336,7 +340,10 @@ extension LogicalConnectorReplacementSchemataLowerer {
                 throw SchemataLoweringError.anchorRejected(mutationID: point.id, diagnosis: verification.diagnosis)
             }
             guard let resolved = resolveInfix(for: point, in: originalData) else {
-                throw SchemataLoweringError.anchorRejected(mutationID: point.id, diagnosis: "no InfixOperatorExprSyntax resolved at splice time")
+                throw SchemataLoweringError.anchorRejected(
+                    mutationID: point.id,
+                    diagnosis: "no InfixOperatorExprSyntax resolved at splice time"
+                )
             }
             let range = ByteRange(
                 start: resolved.infix.positionAfterSkippingLeadingTrivia.utf8Offset,
@@ -345,12 +352,16 @@ extension LogicalConnectorReplacementSchemataLowerer {
             resolvedByPoint[point.id] = (resolved.infix, range)
         }
 
-        if let (first, second) = firstOverlap(among: filePoints.map { resolvedByPoint[$0.point.id]!.range }, ids: filePoints.map(\.point.id)) {
+        let envelopes = filePoints.map { resolvedByPoint[$0.point.id]!.range }
+        if let (first, second) = firstOverlap(among: envelopes, ids: filePoints.map(\.point.id)) {
             throw SchemataLoweringError.overlappingRewriteEnvelopes(file: source.relativePath, first: first, second: second)
         }
 
         var bytes = [UInt8](originalData)
-        for (point, token) in filePoints.sorted(by: { resolvedByPoint[$0.point.id]!.range.start > resolvedByPoint[$1.point.id]!.range.start }) {
+        let descendingByStart = filePoints.sorted {
+            resolvedByPoint[$0.point.id]!.range.start > resolvedByPoint[$1.point.id]!.range.start
+        }
+        for (point, token) in descendingByStart {
             let (infix, range) = resolvedByPoint[point.id]!
             let lhsText = infix.leftOperand.trimmedDescription
             let rhsText = infix.rightOperand.trimmedDescription

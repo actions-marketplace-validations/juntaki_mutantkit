@@ -28,12 +28,23 @@ public enum MutationConfidence: String, Codable, Sendable, CaseIterable, Compara
 ///
 /// v0.1 only ever produces `.isolated`. `.schemata` exists in the model now so
 /// that plan files written today stay readable once schemata lands, and so the
-/// differential test in Phase 4 has something to compare against.
+/// differential test has something to compare against.
 public enum ExecutionMode: String, Codable, Sendable {
     /// One mutant per source rewrite, per build. The reference implementation.
     case isolated
     /// Many mutants in one build, selected at runtime. Optimization only.
     case schemata
+}
+
+/// How finely the baseline coverage pass attributes coverage to tests.
+public enum CoverageGranularity: String, Codable, Sendable {
+    /// One isolated run per test. The finest map, and the slowest pass: a
+    /// suite of thousands of tests pays one process start for each.
+    case test
+    /// One run per test suite, its coverage given to every test in it. The
+    /// map can only name more tests for a line than `.test` would, never
+    /// fewer, so a mutant runs a few more tests and misses none.
+    case suite
 }
 
 // MARK: - Byte range
@@ -138,8 +149,13 @@ public struct CommandRecord: Hashable, Codable, Sendable {
 /// guess at its shape.
 public enum SchemaVersion {
     public static let plan = 1
-    public static let result = 1
-    /// Bumped to 2 for ADR-0005 PR F: `SchemataPlacement.embedded` carries a
+    /// Bumped to 2 for the `notMaterialized` outcome: a `report.json` can now carry an outcome value
+    /// that a reader of version 1 cannot decode. Readers accept every version from
+    /// `oldestReadableResult` up to this one; a report written by an older tool still loads.
+    public static let result = 2
+    /// The oldest `report.json` schema version this tool still reads.
+    public static let oldestReadableResult = 1
+    /// Bumped to 2 for multi-target embedding: `SchemataPlacement.embedded` carries a
     /// list of per-target placements now, not a single flat set of fields —
     /// a plan written under schemaVersion 1 cannot decode against this
     /// type, by design (`SchemataPlan.decodeAndValidate`'s own
@@ -153,7 +169,7 @@ public enum SchemaVersion {
     /// a version bump that actually belongs to `RunHistoryRecord`.
     public static let agentEvidenceReport = 1
     public static let runHistoryRecord = 1
-    public static let operatorCatalogEntry = 1
+    public static let operatorCatalogEntry = 2
     public static let qualityGateResult = 1
     public static let buildDiagnosis = 1
     public static let configurationValidationResult = 1
@@ -164,6 +180,10 @@ public enum SchemaVersion {
     public static let nextFixRecommendation = 1
     /// `mutantkit verify --json` — `VerifyResult`.
     public static let verifyResult = 1
+    /// `mutantkit verify-run --json` — `VerifyRunResult`.
+    public static let verifyRunResult = 1
+    /// The evidence archive's manifest and observation files.
+    public static let evidenceArchive = 1
     /// Shared by every command's `--json` error path (`JSONErrorEnvelope`),
     /// unlike every constant above, which is one per command's *success*
     /// shape. An agent recognizes "this command failed" the same way

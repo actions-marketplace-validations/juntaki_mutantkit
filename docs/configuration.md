@@ -3,8 +3,7 @@
 Full `mutantkit.yml` field reference. See the [README](../README.md) for a
 short example and for how a config is discovered (`setup`/`init` write one
 for you). See [Execution](execution.md) for `execution.profile` and the
-recommended production tuning, and [Benchmarks](benchmarks.md) for the
-measurements behind it.
+recommended production tuning.
 
 The example below is a hand-maintained reference showing every field with
 its default or a representative value; `Sources/CLI/ConfigurationLoader
@@ -21,7 +20,7 @@ version: 1
 project:
   kind: auto                 # or swiftPackageMacOS | swiftPackageApple | xcodeProject | xcodeWorkspace
   scheme: App
-  destination: platform=iOS Simulator,name=iPhone 16
+  destination: platform=iOS Simulator,name=<device name>   # must match an installed simulator
 
 sources:
   include: [Sources/**]
@@ -39,7 +38,7 @@ tests:
   parallel: false
 
 operators:
-  profile: default           # conservative | default | experimental
+  profile: default           # default | stronger | all  (legacy: conservative | experimental)
 
 execution:
   strategy: isolated
@@ -55,7 +54,22 @@ execution:
   # reported `flaky` and excluded from the score instead of silently inflating
   # it. Doubles the test invocation for every mutant that looks killed, which is
   # the common case in a well-tested project — real cost for a suite you already
-  # suspect of flaking under `tests.parallel`.
+  # suspect of flaking under `tests.parallel`. A kill whose retest reproduces the
+  # failure is also checked against the unmutated build: the same tests must
+  # pass there, otherwise the failure is not shown to come from the mutation
+  # and the kill is not counted. That control run is shared by kills with the
+  # same test selection, so it adds one run per distinct selection, not one per
+  # kill.
+  # The default stays false. Two measured limits of turning it on:
+  # with `tests.parallel: false` (the default) SwiftPM writes no per-test
+  # breakdown, so the first run cannot name which tests failed and every
+  # retest-confirmed kill ends up `flaky` ("which test caught it could not be
+  # compared between the two runs"); enable `tests.parallel` with it. And the
+  # unmutated control runs in a clone of the built products, so a test that
+  # reaches a built binary through a path relative to the original products
+  # directory fails in the clone; if it is among the tests that caught the
+  # mutant, a genuine kill is demoted to `flaky`. That direction is safe (a
+  # kill is lost, never invented).
   retestKilledMutants: false
   # On by default. A mutant whose test run crashes, or times out, is re-run
   # once before the verdict is trusted, the same "prove it reproduces"
@@ -67,7 +81,9 @@ execution:
   confirmTimedOutMutants: true
   # Narrows each mutant's test run to only the tests that cover its mutated
   # line, measured once against the unmutated baseline. A mutant on a line no
-  # test reaches is `noCoverage` without ever being built. The single largest
+  # test reaches is `noCoverage` without ever being built. Without it, nothing
+  # is classified `noCoverage`: such a mutant runs against the whole suite and
+  # is reported as `survived`. The single largest
   # speedup available before touching incrementalBuild/simulatorPool below —
   # cached against an unchanged source tree, test suite, scheme, test targets
   # and toolchain, and reused across runs that differ in anything else
@@ -96,8 +112,10 @@ execution:
   # Off by default. Routes every isolated-backend SwiftPM sandbox's Clang/
   # Swift module cache (system frameworks only, never project code) to one
   # external directory shared across sandboxes instead of each rebuilding
-  # its own — real speedup on cold system-framework compilation, wiped and
-  # rebuilt fresh at the start of every process. Not safe to combine with
+  # its own — a speedup on cold system-framework compilation with Xcode 26
+  # and earlier, wiped and rebuilt fresh at the start of every process. Not
+  # expected to help on Xcode 27, where SwiftPM no longer stores module files
+  # in this cache. Not safe to combine with
   # concurrent `mutantkit run`s against the same project on different
   # destinations — see `ExecutionSettings.sharedModuleCache`'s doc comment.
   # sharedModuleCache: true
@@ -111,9 +129,9 @@ execution:
   # An older way to amortize the fixed simulator install/launch cost: merges
   # several mutants' test runs into one xcodebuild invocation instead of one
   # per mutant. Requires selectCoveringTests and an Xcode project or
-  # workspace destination. A real benchmark against a large iOS app (see
-  # docs/benchmarks.md) found `simulatorPool: true` with `workers: 2` faster
-  # than this at the same scale — kept available since it does not require
+  # workspace destination. Measured on a large iOS app, `simulatorPool: true`
+  # with `workers: 2` was faster than this at the same scale (see
+  # docs/execution.md) — kept available since it does not require
   # provisioning extra simulator clones, which some CI runners restrict.
   # Mutually exclusive in practice: `simulatorPool` has no effect once
   # `testBatchSize` is set, since a batch already shares one lane.
@@ -131,6 +149,34 @@ timeouts:
     maximum: 5m
 
 reports: [console, xcode, stryker-json, html]
+
+# Off by default. When on, a run also writes the full observations behind
+# each result it evaluated to `.mutantkit/evidence/<run-id>/`, so `mutantkit
+# verify-run` and `mutantkit trust` can re-run the verifier offline instead of
+# trusting the report's own outcomes. What is archived, per mutant: the
+# command records of its build and test runs (executable, arguments, the
+# ABSOLUTE working directory, the environment variables the tool itself set,
+# exit codes), the paths of the result artifacts, the source diff and file
+# hashes, and the diagnoses. These can reveal machine-local paths and project
+# source, so the directories are created owner-only (0700) and the files 0600.
+# `mutantkit init` does not add a `.gitignore` entry: ignore `.mutantkit/`
+# yourself, and do not share an archive without reviewing it. Command
+# records only ever carry environment variables the tool itself set (today
+# none), already redacted; the archive stores them as recorded.
+# The archive can be large and never changes a verdict or a score. Results
+# resumed from a checkpoint, served from the cache, or embedded by the
+# schemata strategy have no observations in this run and stay "not verifiable".
+# Archives accumulate: each run with `archive: true` adds a new directory
+# under `.mutantkit/evidence/` and nothing removes it by default (there is no
+# `clean` command; delete directories by hand if you prefer). `keep: N`
+# prunes after a run writes its own archive, leaving the newest N (the run's
+# own included); unset keeps every archive. Pruning removes only directories
+# that look like archives, and a report whose archive was pruned goes back to
+# Tier A. If archive writes fail, the run reports one operational issue with a
+# count and warns on stderr once.
+# evidence:
+#   archive: true
+#   keep: 10
 ```
 
 `overheadAllowance` is additive for a reason. The baseline measures a suite

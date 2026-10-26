@@ -9,7 +9,7 @@ import Testing
 /// independent chunks in parallel (`workers` > 1) — the change this suite
 /// pins: chunk-level fan-out bounded by a `TaskGroup` (mirroring
 /// `MutationRunner.evaluate`'s own "one in, one out" pattern), and
-/// `completedPlacementsByMutationID` (ADR-0008 §4(b)) moved into
+/// `completedPlacementsByMutationID` (the post-hang recovery semantics(b)) moved into
 /// `CompletedPlacementsTracker`, a private actor, so a later-queued chunk's
 /// own hang-budget-overflow check sees an accurate, up-to-date-as-of-now
 /// count of every *other*, already-finished chunk's contribution — never a
@@ -125,7 +125,8 @@ struct SchemataMutationRunnerConcurrencyTests {
             programs.append(program(chunkID: chunkID, entries: [planEntry]))
             entries[point.id] = point
             adapter.scripts[SchemataSelectorToken(namespace: namespace, localIndex: 1)] = .init(
-                compilationUnitID: compilationUnitID(target: target, point: point), sourceEmbeddingID: Self.sourceEmbeddingID, includeHit: true
+                compilationUnitID: compilationUnitID(target: target, point: point),
+                sourceEmbeddingID: Self.sourceEmbeddingID, includeHit: true
             )
         }
 
@@ -398,7 +399,10 @@ struct SchemataMutationRunnerConcurrencyTests {
         #expect(defaultOutcome.results.map(\.id) == explicitOutcome.results.map(\.id))
         #expect(defaultOutcome.results.map(\.outcome) == explicitOutcome.results.map(\.outcome))
         #expect(defaultOutcome.isolatedFallbacks == explicitOutcome.isolatedFallbacks)
-        #expect(defaultOutcome.multiTargetVerdicts.map(\.mutationRef.mutationID) == explicitOutcome.multiTargetVerdicts.map(\.mutationRef.mutationID))
+        #expect(
+            defaultOutcome.multiTargetVerdicts.map(\.mutationRef.mutationID)
+                == explicitOutcome.multiTargetVerdicts.map(\.mutationRef.mutationID)
+        )
 
         // And matches the known-correct sequential expectation itself
         // (mirrors `overflowDropsCrossProgramMutationIDEntirely`): Y keeps

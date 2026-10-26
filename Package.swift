@@ -1,52 +1,6 @@
 // swift-tools-version:6.0
 //
-// Public-projection overlay for the root Package.swift (see
-// .public-tree.toml's [overlay] source_dir = "oss-public"). This file is
-// NOT auto-derived from the private Package.swift -- git-projector's
-// overlay step copies it verbatim over whatever the private manifest
-// declares, so it has to be kept in sync BY HAND whenever a *production*
-// target's name, dependencies, or products change there.
-//
-// It differs from the private manifest in two ways.
-//
-// First, five executable targets that exist only as research/investigation
-// tooling (never referenced by CLI, by any library target, or by any other
-// target's `dependencies:`) are omitted, along with their `Sources/`
-// directories (excluded via .public-tree.toml's `exclude_paths`, not
-// here -- an overlay can only ADD/REPLACE files at the paths it contains,
-// it can't delete a private-tree directory this file doesn't mention):
-//
-//   - BudgetV2Eval             (internal budget-selection-v2 evaluation tool, not part of this public repo)
-//   - PlanSubsetDerivation     (internal budget-selection-v2 evaluation tool, not part of this public repo)
-//   - PlanStats                (TEMP muter-comparison diagnostic, not a frozen protocol)
-//   - SchemataChunkBuildProbe  (TEMP muter-comparison diagnostic, not a frozen protocol)
-//   - DirectXCTestInvokeProbe  (standalone prototype, not wired into any production path)
-//
-// Second, `BenchmarkRunner` and its test target `BenchmarkRunnerTests` are
-// also omitted here (with `Sources/BenchmarkRunner` and
-// `Tests/BenchmarkRunnerTests` excluded the same way via
-// `.public-tree.toml`) -- unlike the five above, this is a competitive-
-// hygiene decision, not a "still unfinished" one. It's a real, working
-// standalone tool that runs MutantKit against Muter and
-// swift-mutation-testing as external processes for a fair competitive
-// comparison; publishing its adapters and validity guards would hand a
-// competitor a free map of their own product's failure modes, discovered
-// here at real investigation cost, for close to zero benefit to a public
-// user (it targets a fixed internal corpus, not an arbitrary package). A
-// release that wants to publish frozen benchmark numbers should do so via
-// a separate, deliberately-written public doc, not by shipping this tool.
-//
-// `SchemataEligibilityClassifier` is also research-labeled in the private
-// manifest's own comment (an internal adr-0008-validation research
-// document, not part of this public repo), but is
-// deliberately KEPT here: `Tests/MutantKitTests/Unit/SchemataEligibilityClassifierTests.swift`
-// (part of the shipped `MutantKitTests` target, which the public repo's
-// own CI builds and runs) does `@testable import SchemataEligibilityClassifier`
-// to pin real `EligibilityClassifier` behavior. Dropping the target here
-// would break that test target's compile in the public snapshot -- not a
-// hygiene win, a regression. Removing it would require first relocating
-// or deleting that test file, which is a separate decision this pass
-// doesn't make.
+// The `mutantkit` package: the CLI, its libraries, and the test target.
 import PackageDescription
 
 let package = Package(
@@ -143,20 +97,12 @@ let package = Package(
             ]
         ),
 
-        // Research-only, outcome-blind classification tool for an internal
-        // adr-0008-validation protocol document's Protocol v3 addendum
-        // (not part of this public repo)
-        // (Corpus B calibration population selection rule): actually runs
+        // Classifies which mutations of a plan a schemata run can embed: it runs
         // SchemataChunkPlanner.plan (the same target-resolution/registry
-        // machinery a real formal run uses) to determine authoritative
-        // embedded membership, not just a lowerer's own `analyze()`. See
+        // machinery a real run uses) to determine authoritative embedded
+        // membership, not just a lowerer's own `analyze()`. See
         // Sources/SchemataEligibilityClassifier/EligibilityClassification.swift's
-        // doc comment.
-        //
-        // Kept in this public manifest (unlike its research siblings)
-        // because `MutantKitTests` — the shipped test target this repo's
-        // own CI builds — `@testable import`s it; see this file's header
-        // comment.
+        // doc comment. `MutantKitTests` `@testable import`s it.
         .executableTarget(
             name: "SchemataEligibilityClassifier",
             dependencies: [

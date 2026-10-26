@@ -20,13 +20,31 @@ public struct SchemataTargetInfo: Sendable, Hashable {
     public let target: String
     public let module: String
     public let product: String
+    /// Whether this target's code runs only inside the test/app process
+    /// (`runtime`) or is also executed by the build itself (`compileTime`,
+    /// e.g. a SwiftPM macro implementation run by the compiler while
+    /// compiling clients). Set only from the build system's own target
+    /// classification, never inferred from a name.
+    public let executionRole: SchemataTargetExecutionRole
 
-    public init(projectIdentity: String, target: String, module: String, product: String) {
+    public init(
+        projectIdentity: String, target: String, module: String, product: String,
+        executionRole: SchemataTargetExecutionRole = .runtime
+    ) {
         self.projectIdentity = projectIdentity
         self.target = target
         self.module = module
         self.product = product
+        self.executionRole = executionRole
     }
+}
+
+/// Build-system-neutral execution role of a target. Schemata selects a
+/// mutation at test runtime, after clients are compiled, so it cannot
+/// observe what a `compileTime` target does during that compilation.
+public enum SchemataTargetExecutionRole: Sendable, Hashable {
+    case runtime
+    case compileTime
 }
 
 /// Everything about the backend/toolchain that identifies *how* a schema
@@ -110,10 +128,14 @@ public enum SchemataChunkPlanner {
         sources: [String: Data],
         targetInfo: [String: [SchemataTargetInfo]],
         backend: SchemataBackendInfo,
-        maxChunkSize: Int = 200
+        maxChunkSize: Int = 200,
+        filesOutsideBuild: [String: String] = [:]
     ) throws -> SchemataChunkPlanResult {
         guard maxChunkSize > 0 else { throw SchemataChunkPlanningError.invalidMaxChunkSize(maxChunkSize) }
-        let classified = try classify(mutationPlan: mutationPlan, registry: registry, sources: sources, targetInfo: targetInfo)
+        let classified = try classify(
+            mutationPlan: mutationPlan, registry: registry, sources: sources, targetInfo: targetInfo,
+            filesOutsideBuild: filesOutsideBuild
+        )
         // One file can belong to more than one target (see
         // `SchemataUnsupportedReason.multipleTargetsNotYetSupported`) —
         // every membership still needs its file available under that
@@ -148,7 +170,7 @@ public enum SchemataChunkPlanner {
             // is what lets a file with many independent comparisons still
             // batch into as few builds as its worst site's own candidate
             // count requires — not one build per mutation.
-            for wave in nonOverlappingWaves(points) {
+            for wave in nonOverlappingWaves(points, envelopes: classified.envelopeByMutationID) {
                 for batch in wave.chunked(into: maxChunkSize) {
                     do {
                         let program = try lower(batch: batch, key: key, lowerer: lowerer, filesByTarget: filesByTarget, sources: sources)
@@ -210,18 +232,46 @@ public enum SchemataChunkPlanner {
         var fallbackEntries: [SchemataPlanEntry] = []
         var groups: [GroupKey: [MutationPoint]] = [:]
         var lowererByID: [String: any SchemataLowerer] = [:]
+        /// Each embedded point's `analyze` rewrite envelope — what the lowerer
+        /// will actually rewrite, which can be wider than `utf8Range` (a
+        /// logical connector's envelope is its whole `lhs op rhs`).
+        var envelopeByMutationID: [MutationID: ByteRange] = [:]
     }
 
     private static func classify(
         mutationPlan: MutationPlan,
         registry: SchemataLowererRegistry,
         sources: [String: Data],
-        targetInfo: [String: [SchemataTargetInfo]]
+        targetInfo: [String: [SchemataTargetInfo]],
+        filesOutsideBuild: [String: String]
     ) throws -> Classification {
         var result = Classification()
         for point in mutationPlan.mutations {
+            if targetInfo[point.file] == nil, let why = filesOutsideBuild[point.file] {
+                // No target the run builds is known to compile it, so no embedded chunk could be exercised.
+                let placeholder = SchemataTargetInfo(projectIdentity: "", target: "", module: "", product: "")
+                result.fallbackEntries.append(fallbackEntry(
+                    point: point, info: placeholder,
+                    reason: .platformUnsupported(reason: why)
+                ))
+                continue
+            }
             guard let infos = targetInfo[point.file], !infos.isEmpty else {
                 throw SchemataChunkPlanningError.missingTargetInfo(file: point.file)
+            }
+            // A source that any target executes at build time (a macro
+            // implementation) is measured by isolated mode as "clients
+            // compiled with the mutated plugin" but by schemata as "the
+            // plugin's own runtime unit tests" — two different experiments
+            // under one MutationID. The whole ID stays isolated, even if
+            // other memberships are runtime targets.
+            if let compileTime = infos.filter({ $0.executionRole == .compileTime })
+                .min(by: { $0.target < $1.target }) {
+                result.fallbackEntries.append(fallbackEntry(
+                    point: point, info: compileTime,
+                    reason: .compileTimeExecutedTarget(target: compileTime.target)
+                ))
+                continue
             }
             // `representative` is only used to give a *fallback* entry
             // some target/module/product to record — deterministic
@@ -244,7 +294,8 @@ public enum SchemataChunkPlanner {
             switch lowerer.analyze(point, source: source) {
             case let .isolatedOnly(reason):
                 result.fallbackEntries.append(fallbackEntry(point: point, info: representative, reason: reason))
-            case .eligible:
+            case let .eligible(_, envelope, _):
+                result.envelopeByMutationID[point.id] = envelope
                 // A file compiled into more than one target (a shared
                 // model file added directly to an app target and a widget
                 // extension's own Compile Sources, say) embeds
@@ -370,10 +421,17 @@ public enum SchemataChunkPlanner {
         let point: MutationPoint
     }
 
-    private static func nonOverlappingWaves(_ points: [MutationPoint]) -> [[MutationPoint]] {
+    private static func nonOverlappingWaves(
+        _ points: [MutationPoint], envelopes: [MutationID: ByteRange]
+    ) -> [[MutationPoint]] {
         var waves: [[WavePoint]] = []
-        for point in points.sorted(by: { ($0.file, $0.utf8Range.start) < ($1.file, $1.utf8Range.start) }) {
-            let wavePoint = WavePoint(file: point.file, range: point.utf8Range, point: point)
+        // Waves are split on the lowerer's rewrite envelope, not just the
+        // anchor token: `a && b && c` has two non-overlapping operator
+        // tokens whose envelopes (`a && b` inside `(a && b) && c`) nest, and
+        // `lower()` rejects overlapping envelopes for the whole batch.
+        func range(of point: MutationPoint) -> ByteRange { envelopes[point.id] ?? point.utf8Range }
+        for point in points.sorted(by: { ($0.file, range(of: $0).start) < ($1.file, range(of: $1).start) }) {
+            let wavePoint = WavePoint(file: point.file, range: range(of: point), point: point)
             if let index = waves.firstIndex(where: { wave in
                 wave.allSatisfy {
                     $0.file != wavePoint.file || $0.range.end <= wavePoint.range.start || wavePoint.range.end <= $0.range.start

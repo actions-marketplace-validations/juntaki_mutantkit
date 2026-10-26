@@ -60,7 +60,11 @@ struct MutationResultCacheTests {
         let point = try makeAnchoredPoint()
         let cache = MutationResultCache(root: root, policy: .permissive)
         let key = MutationResultCache.Key(mutationID: point.id, contextDigest: "digest-A")
-        await store(cache, observations: makeObservations(point: point, outcome: .killedByAssertion, planID: planID, workUnitID: workUnitID), for: key)
+        await store(
+            cache,
+            observations: makeObservations(point: point, outcome: .killedByAssertion, planID: planID, workUnitID: workUnitID),
+            for: key
+        )
 
         await cache.removeAll()
         let loaded = await load(cache, key, point: point)
@@ -91,7 +95,11 @@ struct MutationResultCacheTests {
         // result cache specifically — it never causes a phantom verdict to
         // be silently served. It just falls back to nil, which forces a
         // fresh evaluation, which is exactly what a miss already means.
-        await store(cache, observations: makeObservations(point: point, outcome: .killedByAssertion, planID: planID, workUnitID: workUnitID), for: key)
+        await store(
+            cache,
+            observations: makeObservations(point: point, outcome: .killedByAssertion, planID: planID, workUnitID: workUnitID),
+            for: key
+        )
         let anyFile = try #require(
             try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).first
         )
@@ -120,7 +128,11 @@ struct MutationResultCacheTests {
         let point = try makeAnchoredPoint()
         let cache = MutationResultCache(root: root, policy: .permissive)
         let key = MutationResultCache.Key(mutationID: point.id, contextDigest: "forged")
-        await store(cache, observations: makeObservations(point: point, outcome: .survived, planID: planID, workUnitID: workUnitID), for: key)
+        await store(
+            cache,
+            observations: makeObservations(point: point, outcome: .survived, planID: planID, workUnitID: workUnitID),
+            for: key
+        )
 
         let url = root.appendingPathComponent(storageName(for: key))
         var object = try #require(
@@ -134,6 +146,10 @@ struct MutationResultCacheTests {
         // different verdict in without recomputing anything.
         run["status"] = "failed"
         test["run"] = run
+        // A failure is only credited as a kill when the observation records
+        // which tests the run was allowed to run; a survivor's stored
+        // observation has none, so the edit supplies one.
+        test["execution"] = ["attribution": "standalone", "selection": "wholeSuite", "selectedTests": [String]()]
         observations["test"] = test
         object["observations"] = observations
         try JSONSerialization.data(withJSONObject: object).write(to: url)
@@ -151,7 +167,11 @@ struct MutationResultCacheTests {
         let point = try makeAnchoredPoint()
         let cache = MutationResultCache(root: root, policy: .permissive)
         let key = MutationResultCache.Key(mutationID: point.id, contextDigest: "edited-non-reusable")
-        await store(cache, observations: makeObservations(point: point, outcome: .survived, planID: planID, workUnitID: workUnitID), for: key)
+        await store(
+            cache,
+            observations: makeObservations(point: point, outcome: .survived, planID: planID, workUnitID: workUnitID),
+            for: key
+        )
 
         let url = root.appendingPathComponent(storageName(for: key))
         var object = try #require(
@@ -193,7 +213,7 @@ struct MutationResultCacheTests {
         #expect(loaded?.confirmationDurationSeconds == 1)
     }
 
-    // MARK: - ADR-0005 PR C: verificationVersion gating
+    // MARK: - the verified-verdict cache gate: verificationVersion gating
 
     @Test("A record stamped by an older verifier version is a miss, not served stale")
     func staleVerificationVersionMisses() async throws {
@@ -202,7 +222,7 @@ struct MutationResultCacheTests {
         let observations = makeObservations(point: point, outcome: .killedByAssertion, planID: planID, workUnitID: workUnitID)
 
         // `store` always stamps the version from re-verifying `observations`
-        // itself (ADR-0006 Stage 1) — a stale version can no longer be
+        // itself (the authoritative verdict pipeline) — a stale version can no longer be
         // injected through the public API, so this simulates the on-disk
         // shape a superseded verifier would have left behind directly, the
         // same way `legacyRecordWithoutVersionFieldMisses` below does.
@@ -238,6 +258,39 @@ struct MutationResultCacheTests {
         #expect(loaded == nil, "a pre-PR-C record must be discarded, not silently trusted")
     }
 
+    private func makeScratch() -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mutation-result-cache-tests-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    private func storageName(for key: MutationResultCache.Key) -> String {
+        ContentHash.shortDigest(of: key.mutationID.rawValue + "\u{1F}" + key.contextDigest, length: 32) + ".json"
+    }
+
+    private func writeRawCacheRecord(
+        key: MutationResultCache.Key, observations: MutationObservations,
+        verificationVersion: Int, executionVersion: Int = ExecutionImplementationVersion.current
+    ) throws {
+        struct RawCacheRecord: Codable {
+            let key: MutationResultCache.Key
+            let observations: MutationObservations
+            let verificationVersion: Int
+            let executionVersion: Int
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(
+            RawCacheRecord(
+                key: key, observations: observations,
+                verificationVersion: verificationVersion, executionVersion: executionVersion
+            )
+        )
+        try data.write(to: root.appendingPathComponent(storageName(for: key)))
+    }
+}
+
+extension MutationResultCacheTests {
     // MARK: - Content-identity gating
 
     @Test("An entry whose point content no longer matches the current plan is a miss")
@@ -245,7 +298,11 @@ struct MutationResultCacheTests {
         let point = try makeAnchoredPoint()
         let cache = MutationResultCache(root: root, policy: .permissive)
         let key = MutationResultCache.Key(mutationID: point.id, contextDigest: "digest-A")
-        await store(cache, observations: makeObservations(point: point, outcome: .killedByAssertion, planID: planID, workUnitID: workUnitID), for: key)
+        await store(
+            cache,
+            observations: makeObservations(point: point, outcome: .killedByAssertion, planID: planID, workUnitID: workUnitID),
+            for: key
+        )
 
         // Same ID, different content — the anchor moved since this was cached.
         let movedPoint = point.with(utf8Range: ByteRange(start: point.utf8Range.start + 1, end: point.utf8Range.end + 1))
@@ -262,7 +319,7 @@ struct MutationResultCacheTests {
     /// `PlannedMutationRef.pointDigest`, which folds in `sourceFileHash`.
     ///
     /// The setup is the adversarial one: the *same* mutation site in a file
-    /// that changed somewhere else entirely. ADR-0002 makes the `MutationID`
+    /// that changed somewhere else entirely. The mutation-plan contract makes the `MutationID`
     /// stable across that edit on purpose — occurrence index is scoped to the
     /// enclosing declaration, so adding a function above it renumbers
     /// nothing. So the ID matches, the key matches, and the only thing
@@ -285,7 +342,7 @@ struct MutationResultCacheTests {
         let oldPoint = try #require(try discover(before, using: Operators.boolLiteral).first)
         let newPoint = try #require(try discover(after, using: Operators.boolLiteral).first)
 
-        #expect(oldPoint.id == newPoint.id, "ADR-0002 keeps the ID stable here — that is what makes this adversarial")
+        #expect(oldPoint.id == newPoint.id, "the mutation-plan contract keeps the ID stable here — that is what makes this adversarial")
         #expect(oldPoint.sourceFileHash != newPoint.sourceFileHash, "the file's content really did move")
 
         let cache = MutationResultCache(root: makeScratch(), policy: .permissive)
@@ -370,7 +427,11 @@ struct MutationResultCacheTests {
                         .killedByCrash, .verifiedTimeout] {
             let cache = MutationResultCache(root: makeScratch(), policy: .permissive)
             let key = MutationResultCache.Key(mutationID: point.id, contextDigest: "c-\(outcome.rawValue)")
-            await store(cache, observations: makeObservations(point: point, outcome: outcome, planID: planID, workUnitID: workUnitID), for: key)
+            await store(
+                cache,
+                observations: makeObservations(point: point, outcome: outcome, planID: planID, workUnitID: workUnitID),
+                for: key
+            )
 
             let loaded = await load(cache, key, point: point)
             #expect(loaded != nil, "\(outcome.rawValue) should be cached")
@@ -391,7 +452,11 @@ struct MutationResultCacheTests {
         for outcome in rejected {
             let cache = MutationResultCache(root: makeScratch(), policy: .permissive)
             let key = MutationResultCache.Key(mutationID: point.id, contextDigest: "n-\(outcome.rawValue)")
-            await store(cache, observations: makeObservations(point: point, outcome: outcome, planID: planID, workUnitID: workUnitID), for: key)
+            await store(
+                cache,
+                observations: makeObservations(point: point, outcome: outcome, planID: planID, workUnitID: workUnitID),
+                for: key
+            )
 
             let loaded = await load(cache, key, point: point)
             #expect(loaded == nil, "\(outcome.rawValue) must not be cached — a re-run is expected to differ")
@@ -428,45 +493,14 @@ struct MutationResultCacheTests {
 
         #expect(loaded == nil)
     }
-
-    private func makeScratch() -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mutation-result-cache-tests-\(UUID().uuidString)")
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        return url
-    }
-
-    private func storageName(for key: MutationResultCache.Key) -> String {
-        ContentHash.shortDigest(of: key.mutationID.rawValue + "\u{1F}" + key.contextDigest, length: 32) + ".json"
-    }
-
-    private func writeRawCacheRecord(
-        key: MutationResultCache.Key, observations: MutationObservations,
-        verificationVersion: Int, executionVersion: Int = ExecutionImplementationVersion.current
-    ) throws {
-        struct RawCacheRecord: Codable {
-            let key: MutationResultCache.Key
-            let observations: MutationObservations
-            let verificationVersion: Int
-            let executionVersion: Int
-        }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let data = try JSONEncoder().encode(
-            RawCacheRecord(
-                key: key, observations: observations,
-                verificationVersion: verificationVersion, executionVersion: executionVersion
-            )
-        )
-        try data.write(to: root.appendingPathComponent(storageName(for: key)))
-    }
 }
 
 /// Split from the primary suite above purely to stay under this project's
 /// `type_body_length` SwiftLint limit, not because these tests belong to a
-/// different feature — the P4 (cache soundness) gap-fix regressions for
+/// different feature — the cache-soundness gap-fix regressions for
 /// `ExecutionImplementationVersion`.
 extension MutationResultCacheTests {
-    // MARK: - P4 cache-soundness gap fix: executionVersion gating
+    // MARK: - Cache-soundness gap fix: executionVersion gating
 
     /// Mirrors `staleVerificationVersionMisses` exactly, for the sibling
     /// mechanism `ExecutionImplementationVersion` adds: a record stamped by
@@ -540,7 +574,10 @@ extension MutationResultCacheTests {
         // that changed, simulating exactly the "bug fixed, version bump
         // forgotten" shape this mechanism must not depend on to stay sound.
         let newPoint = oldPoint.with(replacementText: "REPLACEMENT_TEXT_AFTER_THE_OPERATOR_BUG_FIX")
-        #expect(oldPoint.id == newPoint.id, "an unbumped operatorVersion keeps the MutationID identical — that is what makes this adversarial")
+        #expect(oldPoint.id == newPoint.id,
+                """
+                an unbumped operatorVersion keeps the MutationID identical — that is what makes this adversarial
+                """)
         #expect(oldPoint.replacementText != newPoint.replacementText, "the fixture must actually change what the operator now proposes")
 
         let cache = MutationResultCache(root: makeScratch(), policy: .permissive)
@@ -554,5 +591,42 @@ extension MutationResultCacheTests {
         let loaded = await load(cache, key, point: newPoint)
 
         #expect(loaded == nil, "a verdict measured against a different replacement text must never be served for the new one")
+    }
+
+    @Test("Under retest policy, a cached kill with a recorded confirmation reloads with it; one without still misses")
+    func cachedKillReverifiedCarriesAssertionKillConfirmation() async throws {
+        let point = try makeAnchoredPoint()
+        let policy = MutationVerdictVerifier.VerdictVerificationPolicy(
+            retestKilledMutants: true, confirmCrashKills: false, confirmTimedOutMutants: false
+        )
+        let cache = MutationResultCache(root: root, policy: policy)
+        let summary = TestOutcomeSummary(total: 3, passed: 2, failed: 1, failingTests: ["T/testA()"], durationSeconds: nil)
+        func failed() -> TestRunResult {
+            TestRunResult(
+                status: .failed, summary: summary,
+                command: CommandRecord(executable: "/usr/bin/true", arguments: [], workingDirectory: "/tmp"),
+                resultArtifactPath: nil, diagnosis: "d"
+            )
+        }
+        let base = makeObservations(point: point, outcome: .killedByAssertion, planID: planID, workUnitID: workUnitID)
+        let confirmedObservations = MutationObservations(
+            plannedMutation: base.plannedMutation, sourceApplication: base.sourceApplication, build: base.build,
+            test: SingleTestObservation(
+                run: failed(), applicationEvidence: base.test?.applicationEvidence, execution: base.test?.execution
+            ),
+            confirmations: [ConfirmationObservation(kind: .kill, run: failed(), baselineControl: makePassingBaselineControl())]
+        )
+        let confirmedKey = MutationResultCache.Key(mutationID: point.id, contextDigest: "digest-confirmed")
+        await store(cache, observations: confirmedObservations, for: confirmedKey)
+        let loaded = await load(cache, confirmedKey, point: point)
+        #expect(loaded?.outcome == .killedByAssertion)
+        #expect(loaded?.origin == .crossRunCache)
+        #expect(loaded?.evidence?.assertionKillConfirmation?.disposition == .confirmed)
+
+        let bareKey = MutationResultCache.Key(mutationID: point.id, contextDigest: "digest-bare")
+        await store(cache, observations: base, for: bareKey)
+        let bare = await load(cache, bareKey, point: point)
+        #expect(bare?.evidence?.assertionKillConfirmation?.disposition != .confirmed)
+        #expect(bare?.outcome != .killedByAssertion)
     }
 }

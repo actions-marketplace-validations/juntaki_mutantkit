@@ -84,9 +84,28 @@ public enum ConfigurationValidator {
             ))
         }
 
-        issues += validateBudgetSampling(configuration.execution.budget)
+        issues += validateBudgetSampling(configuration.execution.budget) + validateEvidence(configuration.evidence)
+        issues += validateTimeouts(configuration.timeouts)
+        issues += validateExecutionDependencies(configuration.execution)
 
-        if configuration.timeouts.baselineSeconds <= 0 {
+        // `.schemata` is now consumed — `RunCommand` dispatches to
+        // `SchemataRunOrchestration` for it (SwiftPM only; see the schemata
+        // production-integration plan). Unsupported project kinds fail
+        // closed at run time instead (`SchemataRunOrchestration
+        // .OrchestrationError.adapterNotSchemataCapable`), not here: this
+        // preflight runs before the project adapter is even resolved, so it
+        // cannot yet know whether `.schemata` is viable for this project.
+
+        issues += validateDerivedDataPath(configuration.project.derivedDataPath, projectRoot: projectRoot)
+        issues += validateXcodeTestTargets(configuration) + validateProfileCoverageSkip(configuration.execution)
+
+        return issues
+    }
+
+    private static func validateTimeouts(_ timeouts: TimeoutSettings) -> [ConfigurationIssue] {
+        var issues: [ConfigurationIssue] = []
+
+        if timeouts.baselineSeconds <= 0 {
             issues.append(ConfigurationIssue(
                 severity: .error,
                 path: "timeouts.baseline",
@@ -94,7 +113,7 @@ public enum ConfigurationValidator {
             ))
         }
 
-        let mutant = configuration.timeouts.mutant
+        let mutant = timeouts.mutant
         if mutant.minimumSeconds <= 0 || mutant.maximumSeconds <= 0 {
             issues.append(ConfigurationIssue(
                 severity: .error,
@@ -122,7 +141,13 @@ public enum ConfigurationValidator {
             ))
         }
 
-        if configuration.execution.selectCoveringTests, !configuration.execution.measureCoverage {
+        return issues
+    }
+
+    private static func validateExecutionDependencies(_ execution: ExecutionSettings) -> [ConfigurationIssue] {
+        var issues: [ConfigurationIssue] = []
+
+        if execution.selectCoveringTests, !execution.measureCoverage {
             issues.append(ConfigurationIssue(
                 severity: .warning,
                 path: "execution.selectCoveringTests",
@@ -131,7 +156,7 @@ public enum ConfigurationValidator {
             ))
         }
 
-        if let batchSize = configuration.execution.testBatchSize, batchSize < 1 {
+        if let batchSize = execution.testBatchSize, batchSize < 1 {
             issues.append(ConfigurationIssue(
                 severity: .error,
                 path: "execution.testBatchSize",
@@ -139,12 +164,12 @@ public enum ConfigurationValidator {
             ))
         }
 
-        if !(0 ... 1).contains(configuration.execution.noOpCanarySampleRate) {
+        if !(0 ... 1).contains(execution.noOpCanarySampleRate) {
             issues.append(ConfigurationIssue(
                 severity: .error,
                 path: "execution.noOpCanarySampleRate",
                 message: "Must be between 0 and 1 (a fraction of hash-matched mutants to sample), not "
-                    + "\(configuration.execution.noOpCanarySampleRate)."
+                    + "\(execution.noOpCanarySampleRate)."
             ))
         }
 
@@ -154,8 +179,8 @@ public enum ConfigurationValidator {
         // here would take the batched code path while batching nothing — pure
         // overhead with no speedup, and a configuration that looks like it
         // asked for batching but silently got none.
-        if configuration.execution.testBatchSize != nil,
-           !configuration.execution.selectCoveringTests {
+        if execution.testBatchSize != nil,
+           !execution.selectCoveringTests {
             issues.append(ConfigurationIssue(
                 severity: .warning,
                 path: "execution.testBatchSize",
@@ -166,8 +191,8 @@ public enum ConfigurationValidator {
         // `earlyAbortSelectedTests` wraps the covering-tests adapter, so it is
         // inert without `selectCoveringTests` (see RunCommand's test-adapter
         // selection). Flag it rather than silently ignoring the setting.
-        if configuration.execution.earlyAbortSelectedTests,
-           !configuration.execution.selectCoveringTests {
+        if execution.earlyAbortSelectedTests,
+           !execution.selectCoveringTests {
             issues.append(ConfigurationIssue(
                 severity: .warning,
                 path: "execution.earlyAbortSelectedTests",
@@ -175,23 +200,6 @@ public enum ConfigurationValidator {
                     + "without it, earlyAbortSelectedTests has no effect."
             ))
         }
-
-        // `.schemata` is now consumed — `RunCommand` dispatches to
-        // `SchemataRunOrchestration` for it (SwiftPM only; see the schemata
-        // production-integration plan). Unsupported project kinds fail
-        // closed at run time instead (`SchemataRunOrchestration
-        // .OrchestrationError.adapterNotSchemataCapable`), not here: this
-        // preflight runs before the project adapter is even resolved, so it
-        // cannot yet know whether `.schemata` is viable for this project.
-
-        issues += validateDerivedDataPath(configuration.project.derivedDataPath, projectRoot: projectRoot)
-        // `validateProfileCoverageSkip` folded onto this same line (rather
-        // than its own `issues += ...` statement, the shape every sibling
-        // check above uses) specifically so adding it does not grow
-        // `validate`'s own already-baselined `cyclomatic_complexity`/
-        // `function_body_length` debt by even one line — see that
-        // function's own doc comment for the check itself.
-        issues += validateXcodeTestTargets(configuration) + validateProfileCoverageSkip(configuration.execution)
 
         return issues
     }
@@ -203,6 +211,11 @@ public enum ConfigurationValidator {
     /// resolves a profile (`ExecutionProfileResolver.resolve` returns
     /// `current` unchanged for it), so setting this without also choosing
     /// `optimized`/`experimental` does nothing.
+    private static func validateEvidence(_ evidence: EvidenceSettings?) -> [ConfigurationIssue] {
+        guard let keep = evidence?.keep, keep < 1 else { return [] }
+        return [ConfigurationIssue(severity: .error, path: "evidence.keep", message: "Must be at least 1 when present.")]
+    }
+
     private static func validateProfileCoverageSkip(_ execution: ExecutionSettings) -> [ConfigurationIssue] {
         guard execution.profileCoverageSkip, execution.profile == .reference else { return [] }
         return [ConfigurationIssue(
@@ -397,7 +410,7 @@ public enum ConfigurationValidator {
         return issues
     }
 
-    /// `selection: .v2`'s own validation (ADR-0007 B.3/B.8). Weight
+    /// `selection: .v2`'s own validation (the budget-selection budget and compatibility semantics). Weight
     /// *completeness* against the real operator set is not checkable here —
     /// operators aren't known until planning-time discovery — so only each
     /// configured value's range is checked; `BudgetSelectorV2.allocateCounts`
@@ -414,7 +427,7 @@ public enum ConfigurationValidator {
         // feature on the strength of that evaluation — it lost to v1 on both
         // of the larger corpora measured. It shipped anyway, reachable from a
         // plain `execution.budget.selection: v2`, in v0.1.0 and v0.2.0. See
-        // ADR-0007 for the specification and the current status.
+        // The budget-selection v2 spec for the specification and the current status.
         //
         // Rejected here rather than deleted from `BudgetSettings`: this
         // project's YAML decoding does not reject unknown keys
@@ -437,7 +450,7 @@ public enum ConfigurationValidator {
             message: """
             Budget Selection v2 is withdrawn pending evaluation and cannot be used. \
             Remove execution.budget.selection (and any minimumPerStratum/weight), or set \
-            selection: v1. See ADR-0007 for status.
+            selection: v1.
             """
         ))
 
@@ -550,7 +563,7 @@ public enum ConfigurationJSONSchema {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "profile": { "enum": ["conservative", "default", "experimental"] },
+            "profile": { "enum": ["default", "stronger", "all", "conservative", "experimental"] },
             "disable": { "type": "array", "items": { "type": "string" } },
             "enable": { "type": "array", "items": { "type": "string" } }
           }
@@ -571,7 +584,7 @@ public enum ConfigurationJSONSchema {
                 "seed": { "type": ["integer", "null"] },
                 "stratifyBy": { "enum": ["subtype", "operatorSubtype", null] },
                 "minimumPerOperator": { "type": ["integer", "null"], "minimum": 1 },
-                "selection": { "enum": ["v1", "v2", null], "description": "v1 only. 'v2' is withdrawn pending evaluation and is rejected at configuration validation; see ADR-0007." },
+                "selection": { "enum": ["v1", "v2", null], "description": "v1 only. 'v2' is withdrawn pending evaluation and is rejected at configuration validation." },
                 "minimumPerStratum": { "type": ["integer", "null"], "minimum": 1 },
                 "weight": {
                   "type": ["object", "null"],
@@ -592,7 +605,8 @@ public enum ConfigurationJSONSchema {
             "simulatorPool": { "type": "boolean" },
             "sharedModuleCache": { "type": "boolean" },
             "cleanSubtreeCloning": { "type": "boolean" },
-            "profileCoverageSkip": { "type": "boolean" }
+            "profileCoverageSkip": { "type": "boolean" },
+            "coverageGranularity": { "enum": ["test", "suite"] }
           }
         },
         "timeouts": {
@@ -648,6 +662,14 @@ public enum ConfigurationJSONSchema {
               "additionalProperties": false,
               "properties": { "maximum": { "type": ["integer", "null"] } }
             }
+          }
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "archive": { "type": "boolean" },
+            "keep": { "type": ["integer", "null"], "minimum": 1 }
           }
         }
       }

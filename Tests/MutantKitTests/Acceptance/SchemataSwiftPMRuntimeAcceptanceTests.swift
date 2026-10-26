@@ -68,8 +68,9 @@ struct SchemataSwiftPMRuntimeAcceptanceTests {
 
         // A local path dependency's package *identity* (what `package:`
         // below must name) is derived from its checkout directory name,
-        // not its manifest's `name:` field — `mutantkit-private` here, even
-        // though `Package.swift` declares `name: "MutantKit"`.
+        // not its manifest's `name:` field — whatever this repository's own
+        // checkout directory happens to be named, even though `Package.swift`
+        // declares `name: "MutantKit"`.
         let dependencyIdentity = Acceptance.packageRoot.lastPathComponent
         let packageManifest = """
         // swift-tools-version:6.0
@@ -165,18 +166,23 @@ struct SchemataSwiftPMRuntimeAcceptanceTests {
     /// direct, test-only filter over the raw transcript, not a call to any
     /// production API: deciding which candidate is real is
     /// `MutationVerdictVerifier.verifySchemataChain`'s job alone in
-    /// production (ADR-0006 Stage 2); this suite only needs to confirm the
+    /// production (the schemata proof chain); this suite only needs to confirm the
     /// real runtime actually wrote the record shape that job depends on.
-    private static func matchingStartup(in transcript: RuntimeTranscript, token: SchemataSelectorToken, runID: RunID) -> RuntimeStartupEvent? {
+    private static func matchingStartup(
+        in transcript: RuntimeTranscript, token: SchemataSelectorToken, runID: RunID
+    ) -> RuntimeStartupEvent? {
         transcript.records.compactMap { record -> RuntimeStartupEvent? in
             guard case let .startup(event) = record, event.token == token, event.runID == runID else { return nil }
             return event
         }.first
     }
 
-    private static func matchingHit(in transcript: RuntimeTranscript, startup: RuntimeStartupEvent, token: SchemataSelectorToken) -> RuntimeHitEvent? {
+    private static func matchingHit(
+        in transcript: RuntimeTranscript, startup: RuntimeStartupEvent, token: SchemataSelectorToken
+    ) -> RuntimeHitEvent? {
         transcript.records.compactMap { record -> RuntimeHitEvent? in
-            guard case let .hit(event) = record, event.token == token, event.runID == startup.runID, event.processID == startup.processID else {
+            guard case let .hit(event) = record, event.token == token,
+                  event.runID == startup.runID, event.processID == startup.processID else {
                 return nil
             }
             return event

@@ -112,6 +112,14 @@ enum OutputRedactor {
         }
     }
 
+    /// Replaces the current user's home directory with `~`, so a quoted path
+    /// does not carry the account name into a report.
+    static func abbreviatingHomeDirectory(_ text: String, home: String = NSHomeDirectory()) -> String {
+        let trimmedHome = home.hasSuffix("/") ? String(home.dropLast()) : home
+        guard trimmedHome.count > 1 else { return text }
+        return text.replacingOccurrences(of: trimmedHome + "/", with: "~/")
+    }
+
     /// Redacts, then keeps the tail.
     ///
     /// The tail, because a compiler's first error is followed by hundreds of
@@ -137,7 +145,7 @@ enum TestProductHasher {
     /// Returns `nil` when no test binary is found or none can be read, which the
     /// caller must treat as "activation unproven" rather than as an
     /// empty-but-valid hash.
-    static func hash(productsDirectory directory: URL) -> String? {
+    static func hash(productsDirectory directory: URL, workspaceRoot: URL) -> String? {
         let bundles = testBundles(in: directory)
         guard !bundles.isEmpty else { return nil }
 
@@ -146,7 +154,7 @@ enum TestProductHasher {
         let componentHashes = bundles
             .compactMap { bundle -> (String, String)? in
                 guard let binary = executable(inBundle: bundle),
-                      let hash = MachOCodeHash.codeHash(ofBinaryAt: binary)
+                      let hash = MachOCodeHash.codeHash(ofBinaryAt: binary, workspaceRoot: workspaceRoot)
                 else { return nil }
                 return (bundle.lastPathComponent, hash)
             }
